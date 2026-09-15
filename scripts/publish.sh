@@ -4,9 +4,9 @@ VERSION=$(cat src/deno.jsonc | jq -r '.version')
 TAG="${1:-latest}"
 
 # deno pack enforce @scope/name for JSR, so we need to temporarily abide by changing the name in deno.jsonc, then change it back after packing
-sed -i "s|auth-dance|@grenierdev/auth-dance|g" ./src/deno.jsonc
+sed -i "s|durable-channel|@grenierdev/durable-channel|g" ./src/deno.jsonc
 deno pack --set-version $VERSION --allow-dirty --output /tmp/package.tgz
-sed -i "s|@grenierdev/auth-dance|auth-dance|g" ./src/deno.jsonc
+sed -i "s|@grenierdev/durable-channel|durable-channel|g" ./src/deno.jsonc
 
 # Clean up & extract temp package
 rm -fr /tmp/package/* /tmp/package/.*
