@@ -12,7 +12,14 @@ protocol is not baked into any of it: `rpc.ts` is one JSON-RPC surface over a hu
 
 ## Install
 
-`durable_channel` is a member of this Deno workspace. Import it by name from another member:
+`durable-channel` is published to npm:
+
+```sh
+deno add npm:durable-channel   # Deno
+npm install durable-channel    # Node
+```
+
+Import it by name:
 
 ```ts
 import {
@@ -24,17 +31,17 @@ import {
 	durableRoutes,
 	MemoryStorage,
 	WebSocketTransport,
-} from "durable_channel";
+} from "durable-channel";
 ```
 
-It depends on `valibot`, resolved through the root import map, and on `hana`, another member of this workspace, which `rpc.ts` uses for the
-JSON-RPC envelope. Nothing outside `rpc.ts` touches either dependency's wire concerns.
+`valibot` is the only runtime dependency. The JSON-RPC envelope layer `rpc.ts` builds on ships in-tree, and nothing outside `rpc.ts` touches
+wire concerns.
 
 ## Quick start
 
 ```ts
 import * as v from "valibot";
-import { durableChannel, DurableChannelHub, durableRoutes, MemoryStorage, RejectAction } from "durable_channel";
+import { durableChannel, DurableChannelHub, durableRoutes, MemoryStorage, RejectAction } from "durable-channel";
 
 type Env = { now(): string };
 
@@ -468,7 +475,7 @@ every channel it subscribes to by running the very same reducers — no separate
 snippets below assume a map that mounts a tic-tac-toe `game:/:id` and a chat `room:/:name`, which is the pair `client.test.ts` plays with.
 
 ```ts
-import { DurableChannelClient, WebSocketTransport } from "durable_channel";
+import { DurableChannelClient, WebSocketTransport } from "durable-channel";
 
 const transport = await WebSocketTransport.connect("ws://127.0.0.1:8000/rpc");
 const client = new DurableChannelClient(routes, transport, { clientId: "alice" });
@@ -618,7 +625,7 @@ socket all fit.
 
 ```ts
 import { Hono } from "hono";
-import { attachSocket, createRpc, DurableChannelHub, MemoryStorage } from "durable_channel";
+import { attachSocket, createRpc, DurableChannelHub, MemoryStorage } from "durable-channel";
 
 const hub = new DurableChannelHub(routes, { storage: new MemoryStorage(), env });
 const rpc = createRpc(hub);
