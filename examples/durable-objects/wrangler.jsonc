@@ -1,0 +1,13 @@
+{
+	"name": "durable-channel-distributed-example",
+	"main": "worker.ts",
+	"compatibility_date": "2026-07-01",
+	"durable_objects": {
+		"bindings": [
+			{ "name": "CHANNELS", "class_name": "ChannelObject" },
+			{ "name": "GATEWAYS", "class_name": "GatewayObject" }
+		]
+	},
+	"migrations": [{ "tag": "distributed-v1", "new_sqlite_classes": ["ChannelObject", "GatewayObject"] }],
+	"vars": { "LOGICAL_HUB": "example-tenant/distributed-v1" }
+}

@@ -197,6 +197,7 @@ function worker() {
 							await ctx.dispatch(ctx.uri, "worker/stepped", {});
 						}
 					});
+					if (!("serverSeq" in first)) throw new Error("Expected a global commit");
 					return { first: first.serverSeq };
 				})
 		)

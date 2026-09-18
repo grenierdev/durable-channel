@@ -1,0 +1,17 @@
+{
+	"tasks": {
+		"dev": "celld dev . --logs",
+		"distributed:do:check": "deno check --frozen --cached-only test-distributed-do.ts && deno check --frozen --cached-only worker.ts && celld deploy --dry-run .",
+		"distributed:do:test": "deno run --frozen --cached-only -A test-distributed-do.ts"
+	},
+	"compilerOptions": {
+		"lib": ["esnext", "dom", "dom.iterable"],
+		"types": ["@cloudflare/workers-types"]
+	},
+	"imports": {
+		"@cloudflare/workers-types": "npm:@cloudflare/workers-types@4.20260702.1",
+		"@std/assert": "jsr:@std/assert@1.0.11",
+		"cloudflare:workers": "./platform.d.ts",
+		"esbuild": "npm:esbuild@0.28.1"
+	}
+}

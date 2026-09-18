@@ -3,6 +3,11 @@
 What milestones 2–4 need, verified against `node_modules/@microsoft/agent-host-protocol/` 0.9.0 and the published spec. Where the two
 disagree the types win (§11).
 
+The AHP integration remains on the colocated `DurableChannelHub` and its global `serverSeq`/scalar reconnect contract. The separate
+`DurableChannelRouter`/`DurableChannelGateway` implementation speaks `durable-channel/distributed-1`, uses per-channel generations and
+cursor maps, and is not AHP-compatible. The existing seven-method `createRpc` surface is also not itself the AHP adapter: the translation
+and official-client integration remain in `src/ahp.test.ts`. No distributed AHP sequencer or translation log is provided.
+
 ## 1. Purpose and scope
 
 | Concept           | Definition                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |

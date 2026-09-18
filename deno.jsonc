@@ -1,6 +1,7 @@
 {
 	"workspace": [
-		"./src"
+		"./src",
+		"./examples/durable-objects"
 	],
 	"nodeModulesDir": "auto",
 	"imports": {

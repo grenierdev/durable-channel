@@ -23,15 +23,29 @@ export interface DurableChannelActionOrigin {
 }
 
 /** A committed action. Carries `rejectionReason` when the hub refused it and left the state untouched. */
-export interface DurableChannelEnvelope {
+export interface DurableChannelActionFields {
 	readonly type: "action";
 	readonly channel: string;
 	readonly name: string;
 	readonly payload: unknown;
-	readonly serverSeq: number;
 	readonly origin?: DurableChannelActionOrigin;
 	readonly rejectionReason?: string;
 }
+
+/** A commit in the colocated, globally sequenced host. Its wire shape is unchanged. */
+export interface DurableChannelEnvelope extends DurableChannelActionFields {
+	readonly serverSeq: number;
+}
+
+/** A commit owned and sequenced by one distributed channel incarnation. */
+export interface DurableChannelDistributedEnvelope extends DurableChannelActionFields {
+	readonly generation: string;
+	readonly channelSeq: number;
+	readonly actionId?: string;
+}
+
+/** Shared definition callbacks must narrow before inspecting a runtime's sequence. */
+export type DurableChannelCommit = DurableChannelEnvelope | DurableChannelDistributedEnvelope;
 
 /** A channel notification. Never persisted, never replayed. */
 export interface DurableChannelNotification {
@@ -130,8 +144,8 @@ export interface DurableChannelOperations<
 		uri: string,
 		name: TName,
 		payload: InferInput<TActions[TName]>,
-	): Promise<DurableChannelEnvelope>;
-	dispatch(uri: string, name: string, payload: unknown): Promise<DurableChannelEnvelope>;
+	): Promise<DurableChannelCommit>;
+	dispatch(uri: string, name: string, payload: unknown): Promise<DurableChannelCommit>;
 	notify<TName extends keyof TNotifications & string>(uri: string, name: TName, payload: InferInput<TNotifications[TName]>): Promise<void>;
 	notify(uri: string, name: string, payload: unknown): Promise<void>;
 	get(uri: string): Promise<unknown>;
@@ -181,7 +195,7 @@ export interface DurableChannelActionEffectContext<TEnv = unknown, TState = unkn
 	/** The state the reducer produced. Already validated, persisted and broadcast. */
 	readonly state: TState;
 	readonly payload: TPayload;
-	readonly envelope: DurableChannelEnvelope;
+	readonly envelope: DurableChannelCommit;
 }
 
 /** The builder's accumulated types, carried on a definition so a route map can read them back. */

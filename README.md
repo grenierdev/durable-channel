@@ -2,13 +2,14 @@
 
 A **durable channel** holds a state at a URI and declares the only ways that state can change. State moves through named **actions** whose
 reducers are pure and synchronous; side effects live in named **commands**, or in an action's **effect**, which runs once the action is
-committed; ephemeral messages are named **notifications**. A **hub** holds a map of URI templates to definitions and owns the authoritative
-instances, the connections, one global sequence number, a bounded replay ring and the storage.
+committed; ephemeral messages are named **notifications**. The colocated **hub** owns the authoritative instances, connections, one global
+sequence number, replay ring and storage. The **distributed** implementation assigns each channel to an independent actor and places
+connections on gateways, with one durable sequence per channel.
 
 The point of the split is that the definition is isomorphic: the same value drives the server and the client, which mirrors the state by
 running the same reducers on the envelopes the hub broadcasts. The library modules use only web-standard APIs, so a hub also runs inside a
-Cloudflare Durable Object with the object's `state.storage` behind `DurableChannelStorage`, and the client runs in a browser. A wire
-protocol is not baked into any of it: `rpc.ts` is one JSON-RPC surface over a hub, and it is the only module that knows a wire exists.
+Cloudflare Durable Object with the object's `state.storage` behind `DurableChannelStorage`, and the client runs in a browser. The colocated
+`rpc.ts` surface and the explicit `distributed/rpc.ts` surface share transports and definitions while keeping their wire contracts separate.
 
 ## Install
 
@@ -34,8 +35,24 @@ import {
 } from "durable-channel";
 ```
 
-`valibot` is the only runtime dependency. The JSON-RPC envelope layer `rpc.ts` builds on ships in-tree, and nothing outside `rpc.ts` touches
-wire concerns.
+`valibot` is the only runtime dependency. The JSON-RPC envelope layer ships in-tree. Distributed core exports also have a `./distributed`
+source package entry; platform imports and celld development tooling stay in the Durable Object example.
+
+## Selecting a runtime
+
+| Requirement                                             | Server                                                                 | Client and wire                                                                      | Ordering                                       |
+| ------------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------- |
+| Colocated host, existing deployments, AHP 0.9.0 adapter | `DurableChannelHub`                                                    | `DurableChannelClient`, `createRpc`, `attachSocket`                                  | Global `serverSeq` and scalar reconnect cursor |
+| Channels distributed across owners                      | `DurableChannelActor`, `DurableChannelRouter`, `DurableChannelGateway` | `DurableChannelDistributedClient`, `createDistributedRpc`, `attachDistributedSocket` | `{ generation, channelSeq }` per URI           |
+
+The existing seven-method JSON-RPC surface is not itself AHP. The AHP translation and official-client integration live in
+[`src/ahp.test.ts`](src/ahp.test.ts) and continue to use the colocated hub. Distributed channels have their own protocol identifier,
+`durable-channel/distributed-1`, and cannot serve an AHP client. There is no distributed global sequencer or consistent multi-channel
+snapshot.
+
+The following quick start and the API sections through **Errors** describe the existing colocated implementation. See
+[Distributed channels](#distributed-channels) for distributed assembly, recovery and migration, and the executable
+[Durable Object example](examples/durable-objects/README.md) for real owner/gateway hosting.
 
 ## Quick start
 
@@ -716,7 +733,7 @@ rather than about a channel:
 | `TransportError`            | `kind`                | `"closed"`, `"io"` or `"protocol"` — the stream ended, threw, or made no sense |
 | `ClientClosedError`         | —                     | the client was shut down, before the call or while it was in flight            |
 
-## Limitations
+## Colocated limitations
 
 - A client drives **one** transport at a time, and one hub. There is no multi-hub client, no retry or back-off policy, and no persisted
   client state: a fresh client starts from a `hello`, and only the same client instance can `reconnect` from what it has already seen.
@@ -739,3 +756,192 @@ rather than about a channel:
   rather than a warning, and an undecodable notification is simply ignored.
 - The client answers a server-initiated request with `-32601`. There is no way to install a handler for one: the protocol has no method a
   hub calls on a peer.
+
+## Distributed channels
+
+Definitions, reducers, schemas, routes and transport types are shared. Each canonical channel URI resolves to one authoritative endpoint;
+that host must guarantee one active owner, including across failover. An actor's process mutex only orders that actor's calls and does not
+provide distributed fencing. Independent actors use independent stores and queues, so a stalled mutation on one channel cannot stop another
+channel. One hot channel still executes its mutations serially.
+
+The router contains no authoritative state, sequence or registry scan. Its `resolve(uri)` returns an actor endpoint. Gateways resolve
+through the router, hold local sockets and persist subscription/binding metadata. Channel membership rows contain stable gateway IDs; host
+adapters reconstruct RPC stubs from those IDs. The complete namespace plus canonical URI must identify an owner to avoid tenant collisions.
+Host authentication binds a stable client identity on every gateway, independently of transient connection IDs.
+
+The following assembly function makes the host dependencies explicit. The actor's store belongs to this URI alone; the gateway receives its
+own independent store and scheduler. A host must install `actor.alarm()` and `gateway.alarm()` as their scheduled callbacks.
+
+```ts
+import {
+	type ChannelStore,
+	type DistributedGatewayResolver,
+	type DistributedOwnerResolver,
+	type DistributedScheduler,
+	DurableChannelActor,
+	DurableChannelGateway,
+	DurableChannelRouter,
+} from "durable-channel";
+
+// Uses `routes` and Env from the quick start above.
+function distributedHost(
+	resolve: DistributedOwnerResolver,
+	gateways: DistributedGatewayResolver,
+	channelStore: ChannelStore,
+	gatewayStore: ChannelStore,
+	channelAlarm: DistributedScheduler,
+	gatewayAlarm: DistributedScheduler,
+) {
+	const router = new DurableChannelRouter(routes, { resolve });
+	const actor = new DurableChannelActor("counter://", routes, {
+		env: { now: () => new Date().toISOString() },
+		router,
+		store: channelStore,
+		scheduler: channelAlarm,
+		gateways,
+	});
+	const gateway = new DurableChannelGateway({
+		id: "gateway-0",
+		router,
+		store: gatewayStore,
+		scheduler: gatewayAlarm,
+	});
+	return { actor, router, gateway };
+}
+```
+
+`MemoryChannelStore` clones JSON values and rolls back thrown transactions, but is process memory. `SqliteChannelStore` accepts structural
+SQL storage with `transactionSync()` and `sync()`, without importing `cloudflare:workers`. Transaction callbacks must be synchronous and
+contain no remote I/O; adapters reject promises/thenables. The host durability boundary completes before successful commit acknowledgement
+or publication. The SQLite example uses separate records for metadata/state, replay, receipts, membership and subscription rows.
+
+`DistributedScheduler.arm(at)` must durably establish a wakeup before it resolves, only moving an existing wakeup earlier. Actor/gateway
+ordering pre-arms work before committing it; host alarms call back after reconstruction. Process timers alone do not meet this contract on
+an evictable runtime. Clock and transient timeout/recovery schedulers are injectable for deterministic tests. The example shows actual
+SQLite transactions, durable alarms, serializable RPC errors and hibernatable WebSocket attachments.
+
+For a browser using that host, connect with the shared transport and explicitly select the distributed client:
+
+```ts
+import { DurableChannelDistributedClient, WebSocketTransport } from "durable-channel";
+
+const transport = await WebSocketTransport.connect("wss://your-distributed-host/connect");
+const distributedClient = new DurableChannelDistributedClient(routes, transport);
+await distributedClient.hello({ subscriptions: ["counter://"] });
+const action = distributedClient.dispatch("counter://", "counter/incremented", { by: 2 });
+const outcome = await action.settled; // confirmed, rejected, or unknown
+console.log(distributedClient.state("counter://"), distributedClient.cursors);
+```
+
+The example Worker defines `counter:/:id` with an `add` action instead; its client imports
+[`examples/durable-objects/routes.ts`](examples/durable-objects/routes.ts) and subscribes to known, host-created URIs. The router and
+distributed client both expose typed `of(template)` handles. `createDistributedRpc(gateway)` handles framed JSON-RPC;
+`attachDistributedSocket(rpc, gateway, socket,
+{ connectionId, clientId })` binds a normal socket, and `attachDistributedTransport` accepts
+an existing framed transport. Hibernating DOs use `createDistributedLink` with the restored binding and their own socket callbacks. Gateway
+shutdown closes only its local sessions.
+
+### Distributed recovery and lifecycle
+
+A distributed snapshot is `{ resource, state, cursor: { generation, channelSeq } }`. An action envelope uses the shared action fields plus
+`generation` and `channelSeq`, and client actions include `actionId`; it has no `serverSeq`. Sequences are nonnegative safe integers, with
+the first committed action at 1. Rejected client actions retain unchanged state but still advance the channel sequence and replay a
+rejection. Sequence exhaustion rejects before mutation.
+
+Creation returns a fresh opaque generation. Destroy persists a tombstone, removes membership and aborts tracked local work. Recreating the
+URI requires explicit creation and generates a different incarnation; even a singleton is not lazily revived from a tombstone. Stateful
+public dispatch/commands carry the generation obtained by subscription. Direct endpoint destroy also requires it. Trusted router calls may
+resolve the current generation at invocation time, or accept an explicit previously observed generation. Delayed old-generation requests
+fail with `STALE_GENERATION`.
+
+Reconnect uses subscriptions and a cursor map. For example, A's cursor of 100 cannot suppress B's action 5:
+
+```json
+{
+	"subscriptions": ["counter:/a", "counter:/b"],
+	"cursors": {
+		"counter:/a": { "generation": "generation-a", "channelSeq": 100 },
+		"counter:/b": { "generation": "generation-b", "channelSeq": 4 }
+	}
+}
+```
+
+The result contains exactly one entry per requested URI under `channels`. Each entry is `replay` with actions and a cursor, `snapshot` with
+a full distributed snapshot, `stateless`, or `missing`. Entries can mix: A can receive a snapshot after history truncation while B replays
+action 5. Missing/wrong-generation/future cursors require snapshots; only a complete retained interval produces replay. Absent, tombstoned,
+internal or inaccessible resources return `missing`. Stateless membership resumes without a state cursor or replay history. Snapshot cuts
+and membership handoff are consistent per channel, with no consistency promise across the result map.
+
+The gateway registers membership before exposing each snapshot cut, buffers each local subscription during recovery and hands messages to
+sockets in order. Acknowledgement means handoff to live sockets or their closure for recovery; it does not mean the application has applied
+the message. Socket failure closes the session so reconnection uses the client's actual applied cursor. Persisted per-gateway publication
+targets, bounded replay and alarms recover the last lost action even without a subsequent action. Truncated history falls back to snapshots.
+Increasing membership revisions and generations fence delayed removal, lease cleanup and ACKs; expired leases need a higher revision to
+rejoin. One stalled gateway cannot hold a channel commit or healthy gateway delivery.
+
+Distributed mirrors ignore duplicate reductions but use matching IDs to settle actions. A gap pauses only that channel and schedules
+recovery with bounded backoff even on an idle connection. Per-subscription epochs fence old replies, frames, unsubscribe/resubscribe and
+transport replacement. `hello({ subscriptions })` replaces membership with the supplied set; omitting the set retains current subscriptions.
+`reconnect(newTransport)` can move to another gateway with the same authenticated identity. A fresh client without mirror state requests
+snapshots; browser persistence is not included.
+
+A snapshot cannot prove whether an outstanding optimistic action committed: such actions settle `unknown`. Replay settles matching recorded
+outcomes and marks unresolved actions unknown. The client never automatically creates a new action ID to repeat unknown work. Applications
+must reconcile unknown outcomes. `connectionError` exposes protocol/backpressure/transport failure; recovery overflow closes the transport
+while preserving actual applied cursors for the next reconnect. Client and gateway action buffers default to 256 entries and 1 MiB per
+subscription, with client recovery snapshots counted against that byte budget. State sizes must fit the configured client recovery budget.
+Distributed hello validates both request and response protocol identifiers; a distributed client closes a provisional global connection
+after detecting its incompatible response.
+
+### Retry receipts, effects and limits
+
+`createDistributedActionId(deadline)` formats an action ID as `<Unix-milliseconds-deadline>.<random-nonce>`. The client defaults to a
+60-second retry window. Keep the original ID, name, payload and generation when explicitly calling `action.retry()` after reconnect;
+changing the deadline creates a new action, never a retry. Identity is supplied by the host. Receipts are scoped by channel generation and
+stable client identity, and an ID reused with different name/payload fails with `ACTION_ID_CONFLICT`.
+
+The actor atomically persists state, sequence, log, receipt and publication work. An exact retained retry returns the recorded envelope
+without another reduction, sequence or effect. A retained receipt remains authoritative when returned after its deadline; after collection,
+an expired ID returns `unknown` without executing the reducer, even if its original request was sent earlier. Admission uses the maximum of
+owner time and a persisted expiration floor, preventing a backwards clock adjustment from reviving collected IDs. Clock skew can shorten the
+useful window or make a deadline exceed the permitted horizon; callers should allow a margin and reconcile expiry rather than extend IDs
+automatically.
+
+Default actor limits are a 5-minute maximum retry horizon, 4096 receipts, 4 MiB of receipts and 256 replay actions. Live receipts are never
+evicted merely to satisfy a count limit. Expired receipts may be collected; exhausted capacity returns retryable `RETRY_CAPACITY` before
+mutation. The caller may retry the same ID within its original window after capacity clears. These bounds provide a finite retry contract,
+not indefinite exactly-once processing. Default delivery settings are 8 concurrent gateway attempts, a 1-second retry delay, 5-second
+attempt timeout and 30-second membership leases; gateway recovery/renewal defaults to 10 seconds. Hosts can configure these limits.
+
+Commands, action effects and `background` run outside commit serialization; self-dispatch does not hold the originating transaction. They
+are best-effort application work and arbitrary closures are not durable workflows. A failed distributed effect leaves the original commit
+intact and is not replayed by a retry or delivery. After ambiguous storage success, a receipt can confirm the commit without re-running an
+effect; an effect might never have started. Destroy aborts tracked work and generation checks reject later context operations even if a
+callback ignores cancellation. An already-issued remote/external operation cannot be undone. Context operations on the originating URI
+retain its generation; cross-channel operations check the origin is active, then resolve the target's current incarnation. Remote
+cancellation is not implemented, and abort signals/functions never cross RPC. Cross-channel effects and commands are not atomic.
+
+Distributed `list(template)` requires an injected `DistributedDirectory` whose `consistency` states its contract. Without one it throws
+`UNSUPPORTED_OPERATION`; there is no automatic global catalog or distributed prefix scan. Public routes/actions and schemas are checked at
+the gateway/owner boundary, and internal endpoints are trusted host capabilities. Authentication and application authorization remain host
+supplied. Local celld tests establish single-node development behavior only; they do not establish production throughput or fleet failover.
+
+### Migrating definitions and storage
+
+Common command/effect contexts now expose `DurableChannelCommit`, the union of the existing `DurableChannelEnvelope` and
+`DurableChannelDistributedEnvelope`. This is a source-level change for callbacks inspecting ordering fields; narrow explicitly:
+
+```ts
+const committed = await ctx.dispatch(ctx.uri, "counter/incremented", { by: 1 });
+if ("serverSeq" in committed) console.log(committed.serverSeq);
+else console.log(committed.generation, committed.channelSeq);
+```
+
+Callbacks that ignore sequence fields work with both runtimes. Concrete global hub APIs still return `DurableChannelEnvelope`; concrete
+distributed APIs return distributed envelopes. The old global envelope, snapshot, storage and reconnect wire shapes are unchanged, and the
+AHP fixture uses those shapes unchanged.
+
+Distributed actor/gateway stores use separate namespaces and the new transactional `ChannelStore` contract. They do not read or
+automatically convert existing `DurableChannelStorage` records. Moving an existing deployment requires an explicit offline export of
+application state, import into fresh distributed generations, and fresh client initialization. An automatic migration tool is deferred.
+Select and expose a separate distributed endpoint when moving clients; do not add a distributed flag to an existing AHP endpoint.

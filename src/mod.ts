@@ -7,3 +7,4 @@ export * from "./routes.ts";
 export * from "./rpc.ts";
 export * from "./storage.ts";
 export * from "./transport.ts";
+export * from "./distributed.ts";
