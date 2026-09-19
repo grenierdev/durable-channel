@@ -10,20 +10,16 @@ With Deno 2.9.6, celld 0.5.0 and esbuild available, run the example tasks from t
 cd examples/durable-objects
 deno install --frozen
 deno task distributed:do:check
-deno task dev
-```
-
-`dev` runs `celld dev` on `http://127.0.0.1:9876` and watches the project. In another terminal, run:
-
-```sh
-cd examples/durable-objects
 deno task distributed:do:test
 ```
 
-The check typechecks the harness and Worker, then runs `celld deploy --dry-run` against the checked-in Wrangler configuration. The test uses
-real HTTP and WebSocket connections to the already-running celld server. Set `CELLD_TEST_URL` to use a different listener and
-`CELLD_TEST_RUN_ID` to make channel names reproducible. Every run otherwise creates unique channel URIs and destroys them during cleanup;
-celld retains its local state under `.celld/dev` across restarts.
+The check typechecks the harness and Worker, then runs `celld deploy --dry-run` against the checked-in Wrangler configuration. The test
+starts `celld dev --clean` for its duration and uses real HTTP and WebSocket connections against it. Set `CELLD_TEST_URL` to choose a
+different local listener and `CELLD_TEST_RUN_ID` to make channel names reproducible. Every run otherwise creates unique channel URIs and
+destroys them during cleanup. The `--clean` flag also ensures the celld instance starts with empty local state.
+
+The separate `deno task dev` command remains available for interactive development; it runs `celld dev` on `http://127.0.0.1:9876` and
+watches the project.
 
 The harness exercises two gateway objects and two channel objects through celld's Durable Object RPC, WebSockets, SQLite storage and alarms.
 It verifies fan-out, independent sequences, a lost final publication recovered by an alarm, moving a client between gateways, retained
