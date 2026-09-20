@@ -12,6 +12,7 @@
  */
 import { type GenericSchema, minLength, pipe, string } from "valibot";
 import { type JsonSchema, toJsonSchema } from "@valibot/to-json-schema";
+import type { DurableChannelPrincipal } from "./channel.ts";
 import { type DurableChannelRoute, type DurableChannelRouteMap, type DurableChannelRoutes, isSingleton } from "./routes.ts";
 
 /** The version of the document format itself, carried as the top-level `durableChannel` member. */
@@ -131,7 +132,9 @@ function describeParams(schema: GenericSchema): DurableChannelDocumentParam[] {
 	return [{ schema: convert(schema, "input") }];
 }
 
-function describeChannel<TEnv>(route: DurableChannelRoute<TEnv>): DurableChannelDocumentChannel {
+function describeChannel<TEnv, TPrincipal extends DurableChannelPrincipal>(
+	route: DurableChannelRoute<TEnv, TPrincipal>,
+): DurableChannelDocumentChannel {
 	const { definition } = route;
 	return {
 		template: route.template,
@@ -164,8 +167,8 @@ function describeChannel<TEnv>(route: DurableChannelRoute<TEnv>): DurableChannel
  * Describes a route map. Pure: it reads definitions only, so the result is the same before and after a
  * hub has run. `DurableChannelHub.generateSchema` is this function applied to the hub's routes.
  */
-export function describeRoutes<TEnv>(
-	routes: DurableChannelRoutes<TEnv, DurableChannelRouteMap>,
+export function describeRoutes<TEnv, TPrincipal extends DurableChannelPrincipal>(
+	routes: DurableChannelRoutes<TEnv, DurableChannelRouteMap, TPrincipal>,
 	options: DurableChannelDocumentOptions = {},
 ): DurableChannelDocument {
 	return {

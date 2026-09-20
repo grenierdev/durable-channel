@@ -1085,6 +1085,7 @@ function fromAction(action: { type: string } & Record<string, unknown>): [string
 
 /** Binds one socket to one `clientId`, and lets a handler ask for the socket to close afterwards. */
 interface AhpLink {
+	readonly connection: DurableChannelConnection | undefined;
 	readonly clientId: string | undefined;
 	bind(clientId: string): void;
 	closeAfterResponse(): void;
@@ -1136,11 +1137,11 @@ async function guarded<T>(task: () => Promise<T>, uri?: string): Promise<T> {
 	}
 }
 
-function boundClientId(link: AhpLink | undefined): string {
-	if (link?.clientId === undefined) {
+function boundConnection(link: AhpLink | undefined): DurableChannelConnection {
+	if (link?.connection === undefined) {
 		throw new JsonRpcError(-32000, "NOT_INITIALIZED: initialize or reconnect first");
 	}
-	return link.clientId;
+	return link.connection;
 }
 
 type RpcEnv = { hub: RootHub; link?: AhpLink; calls: Record<string, number> };
@@ -1175,11 +1176,11 @@ const ahpRpc = new Hana(
 						});
 					}
 					ctx.env.link?.bind(params.clientId);
-					const clientId = boundClientId(ctx.env.link);
+					const connection = boundConnection(ctx.env.link);
 					const snapshots = [];
 					for (const uri of params.initialSubscriptions) {
 						try {
-							const snapshot = await ctx.env.hub.subscribe(clientId, uri);
+							const snapshot = await ctx.env.hub.subscribe(connection, uri);
 							if (snapshot !== undefined) {
 								snapshots.push(snapshot);
 							}
@@ -1221,9 +1222,9 @@ const ahpRpc = new Hana(
 				.handler((params, ctx) => {
 					ctx.env.calls.reconnect = (ctx.env.calls.reconnect ?? 0) + 1;
 					ctx.env.link?.bind(params.clientId);
-					const clientId = boundClientId(ctx.env.link);
+					const connection = boundConnection(ctx.env.link);
 					return guarded(async () => {
-						const result = await ctx.env.hub.reconnect(clientId, params.lastSeenServerSeq, params.subscriptions);
+						const result = await ctx.env.hub.reconnect(connection, params.lastSeenServerSeq, params.subscriptions);
 						const missing = [...result.missing];
 						return result.type === "replay"
 							? { type: "replay" as const, actions: result.actions.map(toWireEnvelope), missing }
@@ -1237,9 +1238,9 @@ const ahpRpc = new Hana(
 				.result(v.object({ snapshot: v.optional(WireSnapshot) }))
 				.handler((params, ctx) => {
 					ctx.env.calls.subscribe = (ctx.env.calls.subscribe ?? 0) + 1;
-					const clientId = boundClientId(ctx.env.link);
+					const connection = boundConnection(ctx.env.link);
 					return guarded(async () => {
-						const snapshot = await ctx.env.hub.subscribe(clientId, params.channel);
+						const snapshot = await ctx.env.hub.subscribe(connection, params.channel);
 						return snapshot === undefined ? {} : { snapshot };
 					}, params.channel);
 				})
@@ -1250,7 +1251,7 @@ const ahpRpc = new Hana(
 				.result(v.null())
 				.handler((params, ctx) => {
 					ctx.env.calls.unsubscribe = (ctx.env.calls.unsubscribe ?? 0) + 1;
-					ctx.env.hub.unsubscribe(boundClientId(ctx.env.link), params.channel);
+					ctx.env.hub.unsubscribe(boundConnection(ctx.env.link), params.channel);
 					return null;
 				})
 		)
@@ -1260,10 +1261,10 @@ const ahpRpc = new Hana(
 				.result(v.nullable(WireEnvelopeSchema))
 				.handler((params, ctx) => {
 					ctx.env.calls.dispatchAction = (ctx.env.calls.dispatchAction ?? 0) + 1;
-					const clientId = boundClientId(ctx.env.link);
+					const connection = boundConnection(ctx.env.link);
 					const [name, payload] = fromAction(params.action);
 					return guarded(async () => {
-						const envelope = await ctx.env.hub.dispatchFrom(clientId, params.channel, name, payload, params.clientSeq, { lenient: true });
+						const envelope = await ctx.env.hub.dispatchFrom(connection, params.channel, name, payload, params.clientSeq, { lenient: true });
 						return envelope === undefined ? null : toWireEnvelope(envelope);
 					}, params.channel);
 				})
@@ -1290,16 +1291,16 @@ const ahpRpc = new Hana(
 				.result(v.null())
 				.handler((params, ctx) => {
 					ctx.env.calls.createSession = (ctx.env.calls.createSession ?? 0) + 1;
-					const clientId = boundClientId(ctx.env.link);
+					const connection = boundConnection(ctx.env.link);
 					return guarded(
 						() =>
-							ctx.env.hub.exec(AHP_ROOT, "createSession", {
+							ctx.env.hub.execFrom(connection, AHP_ROOT, "createSession", {
 								session: params.channel,
 								provider: params.provider,
 								workingDirectories: params.workingDirectories,
 								config: params.config,
 								activeClient: params.activeClient,
-							}, { connectionId: clientId }),
+							}),
 						params.channel,
 					);
 				})
@@ -1310,9 +1311,9 @@ const ahpRpc = new Hana(
 				.result(v.null())
 				.handler((params, ctx) => {
 					ctx.env.calls.disposeSession = (ctx.env.calls.disposeSession ?? 0) + 1;
-					const clientId = boundClientId(ctx.env.link);
+					const connection = boundConnection(ctx.env.link);
 					return guarded(async () => {
-						await ctx.env.hub.exec(params.channel, "disposeSession", {}, { connectionId: clientId });
+						await ctx.env.hub.execFrom(connection, params.channel, "disposeSession", {});
 						return null;
 					}, params.channel);
 				})
@@ -1329,15 +1330,15 @@ const ahpRpc = new Hana(
 				.result(v.null())
 				.handler((params, ctx) => {
 					ctx.env.calls.createChat = (ctx.env.calls.createChat ?? 0) + 1;
-					const clientId = boundClientId(ctx.env.link);
+					const connection = boundConnection(ctx.env.link);
 					// `channel` is the owning session; `chat` is the new chat's own URI.
 					return guarded(async () => {
-						await ctx.env.hub.exec(params.channel, "createChat", {
+						await ctx.env.hub.execFrom(connection, params.channel, "createChat", {
 							chat: params.chat,
 							initialMessage: params.initialMessage,
 							source: params.source,
 							workingDirectories: params.workingDirectories,
-						}, { connectionId: clientId });
+						});
 						return null;
 					}, params.channel);
 				})
@@ -1348,9 +1349,9 @@ const ahpRpc = new Hana(
 				.result(v.null())
 				.handler((params, ctx) => {
 					ctx.env.calls.disposeChat = (ctx.env.calls.disposeChat ?? 0) + 1;
-					const clientId = boundClientId(ctx.env.link);
+					const connection = boundConnection(ctx.env.link);
 					return guarded(async () => {
-						await ctx.env.hub.exec(params.channel, "disposeChat", {}, { connectionId: clientId });
+						await ctx.env.hub.execFrom(connection, params.channel, "disposeChat", {});
 						return null;
 					}, params.channel);
 				})
@@ -1415,12 +1416,15 @@ function boot(
 				}
 				const stale = bound;
 				bound = undefined;
-				hub.disconnect(stale.clientId, stale.connection);
+				hub.disconnect(stale.connection);
 				if (bindings.get(stale.clientId) === socket) {
 					bindings.delete(stale.clientId);
 				}
 			};
 			const link: AhpLink = {
+				get connection() {
+					return bound?.connection;
+				},
 				get clientId(): string | undefined {
 					return bound?.clientId;
 				},

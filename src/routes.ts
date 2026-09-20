@@ -12,7 +12,13 @@
  *
  * The same route map value is given to a hub on the server and to a client, so nothing here does I/O.
  */
-import type { DurableChannel, DurableChannelActionMap, DurableChannelCommandMap, DurableChannelNotificationMap } from "./channel.ts";
+import type {
+	DurableChannel,
+	DurableChannelActionMap,
+	DurableChannelCommandMap,
+	DurableChannelNotificationMap,
+	DurableChannelPrincipal,
+} from "./channel.ts";
 import { InvalidDefinitionError } from "./error.ts";
 
 /** The parameter names of a template, as an object type. A singleton template yields `{}`. */
@@ -56,9 +62,16 @@ export type MatchRoute<TRoutes extends DurableChannelRouteMap, TUri extends stri
 }[keyof TRoutes & string];
 
 /** One compiled route. */
-export interface DurableChannelRoute<TEnv = unknown> {
+export interface DurableChannelRoute<TEnv = unknown, TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal> {
 	readonly template: string;
-	readonly definition: DurableChannel<TEnv>;
+	readonly definition: DurableChannel<
+		TEnv,
+		unknown,
+		DurableChannelActionMap,
+		DurableChannelCommandMap,
+		DurableChannelNotificationMap,
+		TPrincipal
+	>;
 	/** The template's segments, with `:name` entries left as-is. */
 	readonly segments: readonly string[];
 	/** The parameter names, in the order they appear. */
@@ -83,14 +96,18 @@ export interface DurableChannelRouteOptions {
 }
 
 /** What a match produced: the route it hit and the parameters it bound. */
-export interface DurableChannelRouteMatch<TEnv = unknown> {
-	readonly route: DurableChannelRoute<TEnv>;
+export interface DurableChannelRouteMatch<TEnv = unknown, TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal> {
+	readonly route: DurableChannelRoute<TEnv, TPrincipal>;
 	readonly params: Readonly<Record<string, string>>;
 }
 
 /** A built route map. `TRoutes` is a phantom parameter carrying every route's types. */
-export interface DurableChannelRoutes<TEnv = unknown, TRoutes extends DurableChannelRouteMap = DurableChannelRouteMap> {
-	readonly routes: readonly DurableChannelRoute<TEnv>[];
+export interface DurableChannelRoutes<
+	TEnv = unknown,
+	TRoutes extends DurableChannelRouteMap = DurableChannelRouteMap,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
+> {
+	readonly routes: readonly DurableChannelRoute<TEnv, TPrincipal>[];
 }
 
 /** Splits a template or a URI into its segments. */
@@ -99,10 +116,10 @@ function segmentsOf(value: string): string[] {
 }
 
 /** The route whose template matches `uri`, with its bound parameters, or `undefined`. */
-export function matchRoute<TEnv>(
-	routes: DurableChannelRoutes<TEnv, DurableChannelRouteMap>,
+export function matchRoute<TEnv, TPrincipal extends DurableChannelPrincipal>(
+	routes: DurableChannelRoutes<TEnv, DurableChannelRouteMap, TPrincipal>,
 	uri: string,
-): DurableChannelRouteMatch<TEnv> | undefined {
+): DurableChannelRouteMatch<TEnv, TPrincipal> | undefined {
 	const segments = segmentsOf(uri);
 	for (const route of routes.routes) {
 		if (route.segments.length !== segments.length) {
@@ -153,19 +170,28 @@ export function isSingleton(route: { readonly params: readonly string[] }): bool
 }
 
 /** Accumulates routes copy-on-write, so every `.route()` call widens the map's type. */
-export class DurableChannelRoutesBuilder<TEnv = unknown, TRoutes extends DurableChannelRouteMap = Record<never, never>> {
-	#routes: readonly DurableChannelRoute<TEnv>[];
+export class DurableChannelRoutesBuilder<
+	TEnv = unknown,
+	TRoutes extends DurableChannelRouteMap = Record<never, never>,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
+> {
+	#routes: readonly DurableChannelRoute<TEnv, TPrincipal>[];
 
-	constructor(routes: readonly DurableChannelRoute<TEnv>[] = []) {
+	constructor(routes: readonly DurableChannelRoute<TEnv, TPrincipal>[] = []) {
 		this.#routes = routes;
 	}
 
-	build(): DurableChannelRoutes<TEnv, TRoutes> {
+	build(): DurableChannelRoutes<TEnv, TRoutes, TPrincipal> {
 		return Object.freeze({ routes: Object.freeze([...this.#routes]) });
 	}
 
-	env<TNewEnv>(): DurableChannelRoutesBuilder<TNewEnv, TRoutes> {
-		return new DurableChannelRoutesBuilder<TNewEnv, TRoutes>(this.#routes as never);
+	env<TNewEnv>(): DurableChannelRoutesBuilder<TNewEnv, TRoutes, TPrincipal> {
+		return new DurableChannelRoutesBuilder<TNewEnv, TRoutes, TPrincipal>(this.#routes as never);
+	}
+
+	/** The principal every mounted definition may receive from the host. */
+	principal<TNewPrincipal extends TPrincipal>(): DurableChannelRoutesBuilder<TEnv, TRoutes, TNewPrincipal> {
+		return new DurableChannelRoutesBuilder(this.#routes as never);
 	}
 
 	route<
@@ -176,14 +202,15 @@ export class DurableChannelRoutesBuilder<TEnv = unknown, TRoutes extends Durable
 		TNotifications extends DurableChannelNotificationMap,
 	>(
 		template: TTemplate,
-		definition: DurableChannel<TEnv, TState, TActions, TCommands, TNotifications>,
+		definition: DurableChannel<TEnv, TState, TActions, TCommands, TNotifications, TPrincipal>,
 		options?: DurableChannelRouteOptions,
 	): DurableChannelRoutesBuilder<
 		TEnv,
 		& TRoutes
 		& {
 			[K in TTemplate]: { state: TState; actions: TActions; commands: TCommands; notifications: TNotifications };
-		}
+		},
+		TPrincipal
 	> {
 		if (this.#routes.some((route) => route.template === template)) {
 			throw new InvalidDefinitionError(`Duplicate route "${template}"`);

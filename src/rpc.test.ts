@@ -92,12 +92,19 @@ function boot(options?: { replayLimit?: number }) {
 	const aborter = new AbortController();
 	let binding: { clientId: string; connection: DurableChannelConnection } | undefined;
 	const link: DurableChannelLink = {
+		get connection() {
+			return binding?.connection;
+		},
+		unbind() {
+			if (binding) hub.disconnect(binding.connection);
+			binding = undefined;
+		},
 		get clientId(): string | undefined {
 			return binding?.clientId;
 		},
 		bind(clientId: string): void {
 			if (binding !== undefined) {
-				hub.disconnect(binding.clientId, binding.connection);
+				hub.disconnect(binding.connection);
 			}
 			binding = { clientId, connection: hub.connect({ id: clientId, send: (message) => sent.push(message) }) };
 		},

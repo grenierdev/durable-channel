@@ -81,9 +81,9 @@ const hub = new DurableChannelHub(routes, {
 	replayLimit: 1024,
 });
 
-hub.connect({ id: "alice", send: (message) => console.log(message) });
-await hub.subscribe("alice", "counter://"); // { resource: "counter://", state: { count: 0 }, fromSeq: 0 }
-await hub.dispatchFrom("alice", "counter://", "counter/incremented", { by: 2 }, 1); // echoed to alice with `origin`
+const connection = hub.connect({ id: "alice-tab", send: (message) => console.log(message) });
+await hub.subscribe(connection, "counter://"); // { resource: "counter://", state: { count: 0 }, fromSeq: 0 }
+await hub.dispatchFrom(connection, "counter://", "counter/incremented", { by: 2 }, 1); // echoed to alice with `origin`
 await hub.exec("counter://", "reset", {}); // { count: 0, at: "…" }
 await hub.get("counter://"); // { count: 0 }
 ```
@@ -107,9 +107,30 @@ builder can be shared; the type parameters accumulate what was registered, which
 Every builder — the channel itself, an action, a command, a notification — also takes `.summary(text)`, a one-line description that has no
 runtime effect and only feeds the generated document (see _Describing a hub_).
 
-A reducer receives `(state, payload, meta)` where `meta` is `{ uri, params }`. It never sees `env`, a clock or randomness: anything ambient
-has to arrive in the payload. That is the whole reason a client can replay the same actions and land on the same state. Reducers must be
-synchronous and must not mutate the state they are given.
+A reducer receives `(state, payload, meta)` where `meta` is `{ uri, params, origin? }`. It never sees `env`, a clock or randomness: anything
+ambient has to arrive in the payload. That is the whole reason a client can replay the same actions and land on the same state. Reducers
+must be synchronous and must not mutate the state they are given.
+
+`meta.origin` is the envelope's `{ clientId, clientSeq, principalId? }` for client dispatches and is absent for server dispatches (including
+actions dispatched by commands). The client supplies its own identity and pending sequence during optimistic reduction, and uses each
+envelope's origin when applying broadcasts or replay. Reducers can therefore enforce author ownership deterministically:
+
+```ts
+.action((a) =>
+	a.name("log/messagePosted")
+		.payload(v.object({ author: v.string(), text: v.string() }))
+		.client()
+		.reduce((state, payload, meta) => {
+			if (payload.author !== meta.origin?.principalId) {
+				throw new RejectAction("author must match the authenticated principal");
+			}
+			return { ...state, messages: [...state.messages, payload] };
+		})
+)
+```
+
+The host supplies the authenticated principal independently of the tab’s `clientId`. Anonymous dispatches omit `principalId`, so this
+ownership check rejects them as well as server dispatches, which have no origin. Role-based authorization stays in commands.
 
 A command handler receives `(params, ctx)`:
 
@@ -118,6 +139,7 @@ A command handler receives `(params, ctx)`:
 | `env`                                     | the hub's `env`, as declared with `.env<Env>()`                       |
 | `uri`, `params`                           | the instance the command was called on, and its template parameters   |
 | `connectionId`                            | the connection that asked, when it came from one                      |
+| `principal`                               | the optional typed identity supplied by host middleware               |
 | `signal`                                  | the caller's abort signal; the hub never races the handler against it |
 | `state()`                                 | the current state of `uri`                                            |
 | `dispatch`, `notify`                      | commit an action or push a notification, on this channel or another   |
@@ -126,12 +148,90 @@ A command handler receives `(params, ctx)`:
 | `background`                              | hands the hub work that outlives the handler, owned by this instance  |
 | `abortBackground`                         | aborts every background task of this instance                         |
 
-`exec` forwards the caller's `connectionId` and `signal` to the nested command, so work done on behalf of a connection stays attributable
-however deep the call goes, and one abort reaches the whole chain.
+`exec` forwards the caller's `connectionId`, `principal` and `signal` to the nested command, so work done on behalf of a connection stays
+attributable however deep the call goes, and one abort reaches the whole chain.
 
 Handlers receive the **parsed output** of the params schema and return the **input** of the result schema; the hub validates both. The same
 holds for an action: the reducer receives the parsed payload, and the state it returns is validated against the state schema before being
 persisted.
+
+## Optional authentication and typed principals
+
+The host authenticates callers and may attach a principal to each connection. Principals are always optional: there is no hub-level
+anonymous/required switch. Each command or action decides whether to accept an anonymous caller.
+
+Declare your principal type alongside the environment, before registering handlers:
+
+```ts
+import { AuthenticationRequiredError, PermissionDeniedError } from "durable-channel";
+
+type Principal = { id: string; role: "admin" | "member"; name: string };
+
+const account = durableChannel()
+	.env<Env>()
+	.principal<Principal>()
+	.command((c) =>
+		c.name("greeting").params(v.object({})).result(v.string())
+			.handler((_params, ctx) => `Hello, ${ctx.principal?.name ?? "guest"}`)
+	)
+	.command((c) =>
+		c.name("adminName").params(v.object({})).result(v.string())
+			.handler((_params, ctx) => {
+				if (!ctx.principal) throw new AuthenticationRequiredError();
+				if (ctx.principal.role !== "admin") throw new PermissionDeniedError();
+				return ctx.principal.name;
+			})
+	)
+	.build();
+
+const routes = durableRoutes().env<Env>().principal<Principal>().route("account://", account).build();
+```
+
+The type flows from routes into the hub, socket adapter, commands and action effects. `.principal<T>()` is a type declaration like
+`.env<T>()`, not a runtime validator; it may refine an existing principal type but cannot discard fields earlier handlers require.
+Middleware validates custom fields. The library checks the nonempty `id` and shallow-copies/freezes the principal; the application must
+treat nested data as immutable.
+
+For a browser WebSocket, verify the session and allowed Origin before upgrading. Here `readSession` and `isAllowedOrigin` are your
+application's middleware functions, and `hub`/`rpc` serve the typed routes above:
+
+```ts
+async function handleUpgrade(request: Request): Promise<Response> {
+	if (!isAllowedOrigin(request)) return new Response("Forbidden", { status: 403 });
+	const principal: Principal | undefined = await readSession(request);
+	const { socket, response } = Deno.upgradeWebSocket(request);
+	const session = attachSocket(rpc, hub, socket, principal === undefined ? undefined : { principal });
+	// Keep this session in your host's session registry. On logout, expiry or revocation:
+	// session.close(1008, "Session ended");
+	return response;
+}
+```
+
+Without a socket, use `hub.connect({ id: tabId, principal, send })`, then pass its returned connection handle to `subscribe`,
+`dispatchFrom`, `reconnect`, `unsubscribe` and `disconnect`. Use `hub.execFrom(connection, uri, name, params)` for remote commands.
+`hub.exec(uri, name, params)` is trusted server work with no caller identity. Nested `ctx.exec` preserves the accepted caller, including
+their principal, and can access internal routes; direct remote commands cannot.
+
+Use a distinct `clientId` for each tab (the client generates one by default). Tabs may share a principal ID. A new connection with the same
+client ID replaces the old one only when their principal IDs match, including when both are anonymous. The old handle becomes invalid; the
+socket adapter closes the old socket. A different principal cannot displace that active connection.
+
+Only `{ id }` appears in `hello`/`reconnect` responses and `client.principal`. Only `principalId` is added to action origins. Custom fields
+such as role and name stay on the server unless an application explicitly returns or publishes them. Reducers use `meta.origin?.principalId`
+for replayable ownership checks; commands and effects use `ctx.principal` for server-side decisions. Server-dispatched actions still have no
+origin, even when a command initiated them.
+
+Complete `hello` or `reconnect` before dispatching, including for anonymous clients. A reconnect that changes the principal ID (including
+sign-in or sign-out) throws `IdentityChangedError`, closes the client, clears its mirrors and settles pending work as lost. Create a fresh
+client when changing accounts. Refreshing the same principal ID may supply new server-side fields without changing the client's identity.
+
+The host owns credential verification, expiry and revocation; call `session.close()` on every affected socket. Already-admitted commands and
+effects are not rolled back, and background work remains instance-owned. Authentication does not enforce channel permissions: applications
+must enforce access to initial/subsequent subscriptions, replay/snapshots, commands, dispatch and continued delivery, using their adapter
+and application handlers. The standard adapter permits access to public routes for authenticated and anonymous clients.
+
+Custom links expose their bound `connection` and implement `unbind()` for failed-handshake cleanup. Anonymous callers need no principal or
+authentication options.
 
 ## Effects
 
@@ -230,12 +330,12 @@ A route may also be declared **internal**, which means no connection may reach i
 durableRoutes().route("doc:/:id", doc).route("x-catalog://", catalog, { internal: true }).build();
 ```
 
-| From                                        | An internal route is                                                      |
-| ------------------------------------------- | ------------------------------------------------------------------------- |
-| `subscribe(id, uri)`, `dispatchFrom(id, …)` | refused with `RouteNotFoundError`, exactly like a template that is absent |
-| `reconnect(id, seq, uris)`                  | listed in `missing`, so the peer forgets it                               |
-| `dispatch`, `exec`, `notify`, `get`, `list` | a route like any other                                                    |
-| a command's or an effect's `ctx`            | a route like any other                                                    |
+| From                                                                                   | An internal route is                                                      |
+| -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `subscribe(connection, uri)`, `dispatchFrom(connection, …)`, `execFrom(connection, …)` | refused with `RouteNotFoundError`, exactly like a template that is absent |
+| `reconnect(connection, seq, uris)`                                                     | listed in `missing`, so the peer forgets it                               |
+| `dispatch`, `exec`, `notify`, `get`, `list`                                            | a route like any other                                                    |
+| a command's or an effect's `ctx`                                                       | a route like any other                                                    |
 
 That is the whole difference: the flag lives on the route, the matcher ignores it, and the hub enforces it.
 
@@ -276,7 +376,7 @@ A `reconnect` that names a destroyed instance reports it in `missing`, which is 
 
 ```ts
 await hub.destroy("doc:/1");
-await hub.reconnect("alice", hub.serverSeq, ["counter://", "doc:/1"]); // { type: "replay", actions: [], missing: ["doc:/1"] }
+await hub.reconnect(connection, hub.serverSeq, ["counter://", "doc:/1"]); // { type: "replay", actions: [], missing: ["doc:/1"] }
 ```
 
 ### Recipe: a private catalogue channel
@@ -302,26 +402,27 @@ protocol does not define.
 
 Every method awaits `ready()` first, so `serverSeq` and the persisted state are loaded before anything else happens.
 
-| Member                                                          | Returns                                  | Notes                                                                                    |
-| --------------------------------------------------------------- | ---------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `new DurableChannelHub(routes, { storage, env, replayLimit? })` | the hub                                  | `replayLimit` defaults to 1024                                                           |
-| `ready()`                                                       | `Promise<void>`                          | loads the persisted `serverSeq`; idempotent                                              |
-| `serverSeq`                                                     | `number`                                 | the last committed sequence                                                              |
-| `connect({ id, send })`                                         | the connection                           | a second `connect` for a live id replaces the previous link and clears its subscriptions |
-| `disconnect(id, connection?)`                                   | `void`                                   | with `connection`, only when it is still the current one for that id                     |
-| `subscribe(id, uri)`                                            | `Promise<Snapshot \| undefined>`         | `undefined` for a stateless channel; `RouteNotFoundError` for an internal one            |
-| `unsubscribe(id, uri)`                                          | `void`                                   | silent when the connection or the subscription is already gone                           |
-| `reconnect(id, lastSeenServerSeq, uris)`                        | `Promise<replay \| snapshot>`            | restores the subscriptions itself; both variants carry `missing`                         |
-| `dispatch(uri, name, payload)`                                  | `Promise<Envelope>`                      | server-origin; throws rather than committing a rejected envelope                         |
-| `dispatchFrom(id, uri, name, payload, clientSeq, { lenient? })` | `Promise<Envelope \| undefined>`         | `undefined` when `clientSeq` is a duplicate                                              |
-| `exec(uri, name, params, { connectionId?, signal? })`           | `Promise<result>`                        | validates params and result                                                              |
-| `notify(uri, name, payload)`                                    | `Promise<void>`                          | current subscribers only                                                                 |
-| `get(uri)` / `has(uri)`                                         | `Promise<state>` / `Promise<boolean>`    | `get` throws `ChannelNotFoundError`; `has` answers `false` instead                       |
-| `create(uri, state?)` / `destroy(uri)`                          | `Promise<void>`                          | see _Routes and instances_                                                               |
-| `close()`                                                       | `Promise<void>`                          | aborts every background task, awaits them, and refuses new ones                          |
-| `list(template)`                                                | `AsyncGenerator<{ uri, params, state }>` | one prefix scan of the storage, paged                                                    |
-| `of(template)`                                                  | a typed handle                           | see above                                                                                |
-| `generateSchema({ info? })`                                     | `DurableChannelDocument`                 | every route as JSON Schema, see _Describing a hub_                                       |
+| Member                                                                  | Returns                                  | Notes                                                                                  |
+| ----------------------------------------------------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------- |
+| `new DurableChannelHub(routes, { storage, env, replayLimit? })`         | the hub                                  | `replayLimit` defaults to 1024                                                         |
+| `ready()`                                                               | `Promise<void>`                          | loads the persisted `serverSeq`; idempotent                                            |
+| `serverSeq`                                                             | `number`                                 | the last committed sequence                                                            |
+| `connect({ id, principal?, send, onDisconnect? })`                      | the connection                           | a live client ID can be replaced only by the same principal (including both anonymous) |
+| `disconnect(connection)`                                                | `void`                                   | disconnects only that exact handle; stale cleanup never affects its replacement        |
+| `subscribe(connection, uri)`                                            | `Promise<Snapshot \| undefined>`         | `undefined` for a stateless channel; `RouteNotFoundError` for an internal one          |
+| `unsubscribe(connection, uri)`                                          | `void`                                   | requires a live handle; an absent subscription is a no-op                              |
+| `reconnect(connection, lastSeenServerSeq, uris)`                        | `Promise<replay \| snapshot>`            | restores the subscriptions itself; both variants carry `missing`                       |
+| `dispatch(uri, name, payload)`                                          | `Promise<Envelope>`                      | server-origin; throws rather than committing a rejected envelope                       |
+| `dispatchFrom(connection, uri, name, payload, clientSeq, { lenient? })` | `Promise<Envelope \| undefined>`         | `undefined` when `clientSeq` is a duplicate                                            |
+| `exec(uri, name, params, { signal? })`                                  | `Promise<result>`                        | validates params and result                                                            |
+| `execFrom(connection, uri, name, params, { signal? })`                  | `Promise<result>`                        | remote command with captured caller identity; internal routes are hidden               |
+| `notify(uri, name, payload)`                                            | `Promise<void>`                          | current subscribers only                                                               |
+| `get(uri)` / `has(uri)`                                                 | `Promise<state>` / `Promise<boolean>`    | `get` throws `ChannelNotFoundError`; `has` answers `false` instead                     |
+| `create(uri, state?)` / `destroy(uri)`                                  | `Promise<void>`                          | see _Routes and instances_                                                             |
+| `close()`                                                               | `Promise<void>`                          | aborts every background task, awaits them, and refuses new ones                        |
+| `list(template)`                                                        | `AsyncGenerator<{ uri, params, state }>` | one prefix scan of the storage, paged                                                  |
+| `of(template)`                                                          | a typed handle                           | see above                                                                              |
+| `generateSchema({ info? })`                                             | `DurableChannelDocument`                 | every route as JSON Schema, see _Describing a hub_                                     |
 
 ## Describing a hub
 
@@ -416,14 +517,14 @@ type DurableChannelEnvelope = {
 	name: string;
 	payload: unknown;
 	serverSeq: number;
-	origin?: { clientId: string; clientSeq: number };
+	origin?: { clientId: string; clientSeq: number; principalId?: string };
 	rejectionReason?: string;
 };
 type DurableChannelNotification = { type: "notification"; channel: string; name: string; payload: unknown };
 type DurableChannelSnapshot = { resource: string; state: unknown; fromSeq: number };
 type DurableChannelReconnectResult =
-	| { type: "replay"; actions: DurableChannelEnvelope[]; missing: string[] }
-	| { type: "snapshot"; snapshots: DurableChannelSnapshot[]; missing: string[] };
+	| { type: "replay"; actions: DurableChannelEnvelope[]; missing: string[]; principal?: { id: string } }
+	| { type: "snapshot"; snapshots: DurableChannelSnapshot[]; missing: string[]; principal?: { id: string } };
 ```
 
 `origin` is present only for an action a connection dispatched, and `rejectionReason` only for a refused one; both keys are omitted
@@ -439,7 +540,8 @@ channel has `serverSeq > fromSeq`.
 A commit is: validate the payload → run the reducer → validate the new state → persist the state and `serverSeq` → append to the replay ring
 → broadcast. One promise-chain mutex serializes commits hub-wide; commands run outside it and take it once per `dispatch`.
 
-The replay ring keeps the last `replayLimit` envelopes. `reconnect(id, lastSeenServerSeq, uris)` re-subscribes every resumable URI and then:
+The replay ring keeps the last `replayLimit` envelopes. `reconnect(connection, lastSeenServerSeq, uris)` re-subscribes every resumable URI
+and then:
 
 | Situation                                                           | Result                                                                                                    |
 | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
@@ -478,7 +580,7 @@ snippets below assume a map that mounts a tic-tac-toe `game:/:id` and a chat `ro
 import { DurableChannelClient, WebSocketTransport } from "durable-channel";
 
 const transport = await WebSocketTransport.connect("ws://127.0.0.1:8000/rpc");
-const client = new DurableChannelClient(routes, transport, { clientId: "alice" });
+const client = new DurableChannelClient(routes, transport);
 client.connect();
 await client.hello({ subscriptions: ["game:/42"] });
 
@@ -495,21 +597,21 @@ for await (const event of subscription) {
 }
 ```
 
-| Member                                                    | Returns                                      | Notes                                                                           |
-| --------------------------------------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------- |
-| `new DurableChannelClient(routes, transport, options?)`   | the client                                   | `clientId` defaults to `crypto.randomUUID()`, `requestTimeoutMs` to 30 000      |
-| `connect()`                                               | `void`                                       | starts the receive loop over the transport; idempotent                          |
-| `hello({ subscriptions? })`                               | `Promise<{ serverSeq, snapshots }>`          | binds the client id, subscribes, applies the snapshots                          |
-| `reconnect(transport?)`                                   | `Promise<replay \| snapshot>`                | resumes from `lastSeenServerSeq`, on a fresh transport when one is given        |
-| `subscribe(uri)`                                          | `Promise<{ snapshot, subscription }>`        | the iterator is attached before the request leaves, so nothing is missed        |
-| `attachSubscription(uri)` / `unsubscribe(uri)`            | a subscription / `Promise<void>`             | another consumer for a URI already subscribed / tells the hub and forgets it    |
-| `dispatch(uri, name, payload)`                            | `{ clientSeq, settled }`                     | applies the action locally, then sends it. `settled` never rejects              |
-| `exec(uri, name, params)`                                 | `Promise<result>`                            | typed from the route's command                                                  |
-| `state(uri)` / `confirmed(uri)` / `pending(uri)`          | the optimistic state / the confirmed one / … | typed from the route the URI literal matches; `unknown` for a runtime string    |
-| `events()` / `stateChanges()`                             | `AsyncIterableIterator<…>`                   | every inbound event as `{ channel, event }` / every connection-state transition |
-| `connectionState` / `lastSeenServerSeq` / `subscriptions` | the link's state / a number / the URIs       | what a caller needs to decide when to reconnect                                 |
-| `ping()` / `shutdown()`                                   | `Promise<void>`                              | `ping` works before `hello`; `shutdown` is final                                |
-| `of(template)`                                            | a typed handle                               | `.state({ id })`, `.dispatch({ id }, …)`, `.exec`, `.subscribe`, like the hub's |
+| Member                                                    | Returns                                         | Notes                                                                           |
+| --------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------- |
+| `new DurableChannelClient(routes, transport, options?)`   | the client                                      | `clientId` defaults to `crypto.randomUUID()`, `requestTimeoutMs` to 30 000      |
+| `connect()`                                               | `void`                                          | starts the receive loop over the transport; idempotent                          |
+| `hello({ subscriptions? })`                               | `Promise<{ serverSeq, snapshots, principal? }>` | binds the client id, subscribes, applies the snapshots                          |
+| `reconnect(transport?)`                                   | `Promise<replay \| snapshot>`                   | resumes from `lastSeenServerSeq`, on a fresh transport when one is given        |
+| `subscribe(uri)`                                          | `Promise<{ snapshot, subscription }>`           | the iterator is attached before the request leaves, so nothing is missed        |
+| `attachSubscription(uri)` / `unsubscribe(uri)`            | a subscription / `Promise<void>`                | another consumer for a URI already subscribed / tells the hub and forgets it    |
+| `dispatch(uri, name, payload)`                            | `{ clientSeq, settled }`                        | applies the action locally, then sends it. `settled` never rejects              |
+| `exec(uri, name, params)`                                 | `Promise<result>`                               | typed from the route's command                                                  |
+| `state(uri)` / `confirmed(uri)` / `pending(uri)`          | the optimistic state / the confirmed one / …    | typed from the route the URI literal matches; `unknown` for a runtime string    |
+| `events()` / `stateChanges()`                             | `AsyncIterableIterator<…>`                      | every inbound event as `{ channel, event }` / every connection-state transition |
+| `connectionState` / `lastSeenServerSeq` / `subscriptions` | the link's state / a number / the URIs          | what a caller needs to decide when to reconnect                                 |
+| `ping()` / `shutdown()`                                   | `Promise<void>`                                 | `ping` works before `hello`; `shutdown` is final                                |
+| `of(template)`                                            | a typed handle                                  | `.state({ id })`, `.dispatch({ id }, …)`, `.exec`, `.subscribe`, like the hub's |
 
 ### Reconciliation
 
@@ -559,15 +661,15 @@ A transport death is not the end of the client: the mirrors, the subscriptions a
 collection a host may fold into a larger one and `handle` answers one decoded frame. One `DurableChannelLink` binds one connection to one
 client id; `hello` and `reconnect` call `link.bind(clientId)`, and every other method refuses until they have.
 
-| Method        | Kind         | Params                                           | Result                                                        |
-| ------------- | ------------ | ------------------------------------------------ | ------------------------------------------------------------- |
-| `hello`       | request      | `{ clientId, subscriptions? }`                   | `{ serverSeq, snapshots }` — binds the link and subscribes it |
-| `ping`        | request      | `{}`                                             | `null`. Works before `hello`                                  |
-| `reconnect`   | request      | `{ clientId, lastSeenServerSeq, subscriptions }` | a reconnect result, envelopes as-is                           |
-| `subscribe`   | request      | `{ channel }`                                    | `{ snapshot? }` — no member for a stateless channel           |
-| `unsubscribe` | notification | `{ channel }`                                    | —                                                             |
-| `dispatch`    | request      | `{ channel, clientSeq, name, payload }`          | the envelope, or `null` when the `clientSeq` was a duplicate  |
-| `exec`        | request      | `{ channel, name, params }`                      | the command's result                                          |
+| Method        | Kind         | Params                                           | Result                                                                    |
+| ------------- | ------------ | ------------------------------------------------ | ------------------------------------------------------------------------- |
+| `hello`       | request      | `{ clientId, subscriptions? }`                   | `{ serverSeq, snapshots, principal? }` — binds the link and subscribes it |
+| `ping`        | request      | `{}`                                             | `null`. Works before `hello`                                              |
+| `reconnect`   | request      | `{ clientId, lastSeenServerSeq, subscriptions }` | a reconnect result, envelopes as-is                                       |
+| `subscribe`   | request      | `{ channel }`                                    | `{ snapshot? }` — no member for a stateless channel                       |
+| `unsubscribe` | notification | `{ channel }`                                    | —                                                                         |
+| `dispatch`    | request      | `{ channel, clientSeq, name, payload }`          | the envelope, or `null` when the `clientSeq` was a duplicate              |
+| `exec`        | request      | `{ channel, name, params }`                      | the command's result                                                      |
 
 `dispatch` is a request, not a notification, so a caller settles on the direct answer as well as on the echo — both paths lead to the same
 state, because an envelope already applied is recognised by its `serverSeq`. It always dispatches leniently: an unknown action, a
@@ -584,6 +686,8 @@ directions, and `fromRpcNotification` answers `undefined` for anything this prot
 | `NotInitialized`              | `-32003` | the link is bound to no client id yet                               |
 | `ConnectionNotFound`          | `-32004` | `CONNECTION_NOT_FOUND`                                              |
 | `ActionRejected`              | `-32005` | a command threw `RejectAction`; `data` carries `{ reason }`         |
+| `AuthenticationRequired`      | `-32007` | an application handler requires authentication                      |
+| `PermissionDenied`            | `-32009` | an application handler or connection binding denies access          |
 | `MethodNotFound`              | `-32601` | an unknown method, and `UNKNOWN_COMMAND`                            |
 | `InvalidParams`               | `-32602` | params or a payload that fails its schema                           |
 | `InternalError`               | `-32603` | everything else, with no message from the inside                    |
@@ -618,10 +722,10 @@ Writing your own is those three methods and nothing else: deliver frames in orde
 
 ## Serving over WebSocket
 
-`attachSocket(rpc, hub, socket)` is the whole server side for one socket: it owns a link, answers frames in arrival order — one promise
-chain, so a slow `exec` cannot let the next frame overtake it — and turns everything the hub broadcasts into a notification frame. The
-socket is typed as `{ send, close, addEventListener }`, so the global `WebSocket`, a Deno upgraded socket and a Durable Object's server-side
-socket all fit.
+`attachSocket(rpc, hub, socket, { principal? }?)` is the whole server side for one socket: it owns a link, answers frames in arrival order —
+one promise chain, so a slow `exec` cannot let the next frame overtake it — and turns everything the hub broadcasts into a notification
+frame. The socket is typed as `{ send, close, addEventListener }`, so the global `WebSocket`, a Deno upgraded socket and a Durable Object's
+server-side socket all fit.
 
 ```ts
 import { Hono } from "hono";
@@ -684,23 +788,25 @@ the runtime inside `open` alone, so importing `storage.ts` elsewhere never touch
 Every failure is a `DurableChannelError` carrying a stable string `code`, so a transport can map codes onto its own error table without
 matching on messages.
 
-| Class                        | `code`                    | Raised when                                                                       |
-| ---------------------------- | ------------------------- | --------------------------------------------------------------------------------- |
-| `RouteNotFoundError`         | `ROUTE_NOT_FOUND`         | no template matches the URI                                                       |
-| `ChannelNotFoundError`       | `CHANNEL_NOT_FOUND`       | the route matches but no instance exists                                          |
-| `ChannelAlreadyExistsError`  | `CHANNEL_ALREADY_EXISTS`  | `create()` on a URI that already holds an instance                                |
-| `UnknownActionError`         | `UNKNOWN_ACTION`          | no action of that name on the channel                                             |
-| `UnknownCommandError`        | `UNKNOWN_COMMAND`         | no command of that name                                                           |
-| `UnknownNotificationError`   | `UNKNOWN_NOTIFICATION`    | no notification of that name                                                      |
-| `InvalidPayloadError`        | `INVALID_PAYLOAD`         | an action payload, command params or notification payload fails its schema        |
-| `InvalidStateError`          | `INVALID_STATE`           | an initial state, a `create()` state or a reducer's output fails the state schema |
-| `InvalidResultError`         | `INVALID_RESULT`          | a command handler's return value fails its result schema                          |
-| `NotClientDispatchableError` | `NOT_CLIENT_DISPATCHABLE` | a connection dispatched a server-only action                                      |
-| `ConnectionNotFoundError`    | `CONNECTION_NOT_FOUND`    | no connection under that id                                                       |
-| `InvalidDefinitionError`     | `INVALID_DEFINITION`      | an incomplete member, a duplicate name, a template missing a parameter value      |
-| `StatelessChannelError`      | `STATELESS_CHANNEL`       | a state operation on a channel declared without `.state()`                        |
-| `NotInitializedError`        | `NOT_INITIALIZED`         | a wire call that needs a client id arrived on a link nothing has bound            |
-| `RejectAction`               | —                         | a reducer refused the action; **not** a `DurableChannelError`                     |
+| Class                         | `code`                    | Raised when                                                                         |
+| ----------------------------- | ------------------------- | ----------------------------------------------------------------------------------- |
+| `RouteNotFoundError`          | `ROUTE_NOT_FOUND`         | no template matches the URI                                                         |
+| `ChannelNotFoundError`        | `CHANNEL_NOT_FOUND`       | the route matches but no instance exists                                            |
+| `ChannelAlreadyExistsError`   | `CHANNEL_ALREADY_EXISTS`  | `create()` on a URI that already holds an instance                                  |
+| `UnknownActionError`          | `UNKNOWN_ACTION`          | no action of that name on the channel                                               |
+| `UnknownCommandError`         | `UNKNOWN_COMMAND`         | no command of that name                                                             |
+| `UnknownNotificationError`    | `UNKNOWN_NOTIFICATION`    | no notification of that name                                                        |
+| `InvalidPayloadError`         | `INVALID_PAYLOAD`         | an action payload, command params or notification payload fails its schema          |
+| `InvalidStateError`           | `INVALID_STATE`           | an initial state, a `create()` state or a reducer's output fails the state schema   |
+| `InvalidResultError`          | `INVALID_RESULT`          | a command handler's return value fails its result schema                            |
+| `NotClientDispatchableError`  | `NOT_CLIENT_DISPATCHABLE` | a connection dispatched a server-only action                                        |
+| `ConnectionNotFoundError`     | `CONNECTION_NOT_FOUND`    | no connection under that id                                                         |
+| `AuthenticationRequiredError` | `AUTHENTICATION_REQUIRED` | application handler requires a principal                                            |
+| `PermissionDeniedError`       | `PERMISSION_DENIED`       | application denies access, or connection binding conflicts with an active principal |
+| `InvalidDefinitionError`      | `INVALID_DEFINITION`      | an incomplete member, a duplicate name, a template missing a parameter value        |
+| `StatelessChannelError`       | `STATELESS_CHANNEL`       | a state operation on a channel declared without `.state()`                          |
+| `NotInitializedError`         | `NOT_INITIALIZED`         | a wire call that needs a client id arrived on a link nothing has bound              |
+| `RejectAction`                | —                         | a reducer refused the action; **not** a `DurableChannelError`                       |
 
 `DurableChannelError` is also thrown directly, with the code `STORAGE_UNAVAILABLE`, when `DenoKvStorage.open` runs on a runtime that has no
 `Deno.openKv`. An action effect's failure is not translated at all: whatever it throws reaches whoever dispatched the action.
@@ -710,11 +816,12 @@ rather than about a channel:
 
 | Class                       | Carries               | Raised when                                                                    |
 | --------------------------- | --------------------- | ------------------------------------------------------------------------------ |
-| `DurableChannelClientError` | —                     | the base class of the four below                                               |
+| `DurableChannelClientError` | —                     | the base class of client-side failures                                         |
 | `RpcError`                  | `code`, `data`        | the peer answered a request with a JSON-RPC error object                       |
 | `RpcTimeoutError`           | `method`, `timeoutMs` | the request was abandoned locally; no server error happened                    |
 | `TransportError`            | `kind`                | `"closed"`, `"io"` or `"protocol"` — the stream ended, threw, or made no sense |
 | `ClientClosedError`         | —                     | the client was shut down, before the call or while it was in flight            |
+| `IdentityChangedError`      | —                     | a handshake changed the principal ID, including sign-in or sign-out            |
 
 ## Limitations
 

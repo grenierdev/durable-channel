@@ -18,6 +18,20 @@ export class DurableChannelError extends Error {
 	}
 }
 
+/** An application operation requires an authenticated caller. */
+export class AuthenticationRequiredError extends DurableChannelError {
+	constructor() {
+		super("AUTHENTICATION_REQUIRED", "Authentication required");
+	}
+}
+
+/** An application operation or connection binding is not permitted. */
+export class PermissionDeniedError extends DurableChannelError {
+	constructor() {
+		super("PERMISSION_DENIED", "Permission denied");
+	}
+}
+
 /** No route template matches the URI. */
 export class RouteNotFoundError extends DurableChannelError {
 	constructor(uri: string) {
@@ -142,6 +156,13 @@ export class DurableChannelClientError extends Error {
 	constructor(message: string, options?: { cause?: unknown }) {
 		super(message, options);
 		this.name = new.target.name;
+	}
+}
+
+/** A client cannot carry cached state or pending work across account changes. */
+export class IdentityChangedError extends DurableChannelClientError {
+	constructor() {
+		super("The authenticated identity changed; create a new client");
 	}
 }
 

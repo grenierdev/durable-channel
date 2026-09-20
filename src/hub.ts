@@ -20,12 +20,16 @@ import { describeRoutes, type DurableChannelDocument, type DurableChannelDocumen
 import type {
 	DurableChannel,
 	DurableChannelActionDefinition,
+	DurableChannelActionMap,
 	DurableChannelActionOrigin,
 	DurableChannelCommandContext,
+	DurableChannelCommandMap,
 	DurableChannelEnvelope,
 	DurableChannelInstance,
 	DurableChannelMessage,
+	DurableChannelNotificationMap,
 	DurableChannelOperations,
+	DurableChannelPrincipal,
 	DurableChannelReconnectResult,
 	DurableChannelSnapshot,
 } from "./channel.ts";
@@ -38,6 +42,7 @@ import {
 	InvalidResultError,
 	InvalidStateError,
 	NotClientDispatchableError,
+	PermissionDeniedError,
 	RejectAction,
 	RouteNotFoundError,
 	StatelessChannelError,
@@ -59,10 +64,21 @@ import type { DurableChannelStorage } from "./storage.ts";
 
 const SERVER_SEQ_KEY = ["hub", "serverSeq"];
 
-/** One link to a peer. `send` is fire-and-forget: a throwing `send` is swallowed. */
-export interface DurableChannelConnection {
+declare const connectionBrand: unique symbol;
+
+/** A hub-issued capability. Only the hub that issued it may accept it. */
+export interface DurableChannelConnection<TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal> {
+	readonly [connectionBrand]: true;
 	readonly id: string;
+	readonly principal: Readonly<TPrincipal> | undefined;
+}
+
+/** Trusted host input. Identity is never read from a protocol frame. */
+export interface DurableChannelConnectionOptions<TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal> {
+	readonly id: string;
+	readonly principal?: TPrincipal;
 	send(message: DurableChannelMessage): void;
+	onDisconnect?(): void;
 }
 
 /** What a hub needs to run. */
@@ -84,18 +100,26 @@ export interface DurableChannelDispatchOptions {
 
 /** Options of {@link DurableChannelHub.exec}. */
 export interface DurableChannelExecOptions {
-	readonly connectionId?: string;
 	readonly signal?: AbortSignal;
 }
 
+interface Caller<TPrincipal extends DurableChannelPrincipal> extends DurableChannelExecOptions {
+	readonly connectionId?: string;
+	readonly principal?: Readonly<TPrincipal>;
+}
+
 /** A typed view of one route. `params` fills the template's `:name` segments. */
-export interface DurableChannelHandle<TRoutes extends DurableChannelRouteMap, TTemplate extends keyof TRoutes & string> {
+export interface DurableChannelHandle<
+	TRoutes extends DurableChannelRouteMap,
+	TTemplate extends keyof TRoutes & string,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
+> {
 	uri(params: PathToParams<TTemplate>): string;
 	get(params: PathToParams<TTemplate>): Promise<TRoutes[TTemplate]["state"]>;
 	has(params: PathToParams<TTemplate>): Promise<boolean>;
 	create(params: PathToParams<TTemplate>, state?: TRoutes[TTemplate]["state"]): Promise<void>;
 	destroy(params: PathToParams<TTemplate>): Promise<void>;
-	subscribe(connectionId: string, params: PathToParams<TTemplate>): Promise<DurableChannelSnapshot | undefined>;
+	subscribe(connection: DurableChannelConnection<TPrincipal>, params: PathToParams<TTemplate>): Promise<DurableChannelSnapshot | undefined>;
 	dispatch<TName extends keyof TRoutes[TTemplate]["actions"] & string>(
 		params: PathToParams<TTemplate>,
 		name: TName,
@@ -112,19 +136,28 @@ export interface DurableChannelHandle<TRoutes extends DurableChannelRouteMap, TT
 		commandParams: InferInput<TRoutes[TTemplate]["commands"][TName]["params"]>,
 		options?: DurableChannelExecOptions,
 	): Promise<InferOutput<TRoutes[TTemplate]["commands"][TName]["result"]>>;
+	execFrom<TName extends keyof TRoutes[TTemplate]["commands"] & string>(
+		connection: DurableChannelConnection<TPrincipal>,
+		params: PathToParams<TTemplate>,
+		name: TName,
+		commandParams: InferInput<TRoutes[TTemplate]["commands"][TName]["params"]>,
+		options?: DurableChannelExecOptions,
+	): Promise<InferOutput<TRoutes[TTemplate]["commands"][TName]["result"]>>;
 	list(): AsyncIterable<DurableChannelInstance<TRoutes[TTemplate]["state"]>>;
 }
 
-interface Link {
-	readonly connection: DurableChannelConnection;
+interface Link<TPrincipal extends DurableChannelPrincipal> {
+	readonly connection: DurableChannelConnection<TPrincipal>;
+	readonly send: (message: DurableChannelMessage) => void;
+	readonly onDisconnect: (() => void) | undefined;
 	readonly subscriptions: Set<string>;
 	/** Highest `clientSeq` this link has accepted. Never persisted: a new link restarts at 0. */
 	watermark: number;
 }
 
-interface Instance<TEnv = unknown> {
+interface Instance<TEnv = unknown, TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal> {
 	readonly uri: string;
-	readonly route: DurableChannelRoute<TEnv>;
+	readonly route: DurableChannelRoute<TEnv, TPrincipal>;
 	readonly params: Readonly<Record<string, string>>;
 	readonly schema: GenericSchema;
 	state: unknown;
@@ -175,13 +208,17 @@ function reasonOf(error: DurableChannelError): string {
  * A hub over one route map. `TRoutes` comes from the route map, so `dispatch`, `exec`, `notify`, `get`
  * and {@link DurableChannelHub.of} are typed by template and member name.
  */
-export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRouteMap = DurableChannelRouteMap> {
-	#routes: DurableChannelRoutes<TEnv, TRoutes>;
+export class DurableChannelHub<
+	TEnv = unknown,
+	TRoutes extends DurableChannelRouteMap = DurableChannelRouteMap,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
+> {
+	#routes: DurableChannelRoutes<TEnv, TRoutes, TPrincipal>;
 	#storage: DurableChannelStorage;
 	#env: TEnv;
 	#replay: ReplayRing;
-	#instances = new Map<string, Instance<TEnv>>();
-	#links = new Map<string, Link>();
+	#instances = new Map<string, Instance<TEnv, TPrincipal>>();
+	#links = new Map<string, Link<TPrincipal>>();
 	#aborters = new Map<string, AbortController>();
 	#running = new Set<Promise<void>>();
 	#serverSeq = 0;
@@ -189,7 +226,7 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 	#hydration: Promise<void> | undefined;
 	#closed = false;
 
-	constructor(routes: DurableChannelRoutes<TEnv, TRoutes>, options: DurableChannelHubOptions<TEnv>) {
+	constructor(routes: DurableChannelRoutes<TEnv, TRoutes, TPrincipal>, options: DurableChannelHubOptions<TEnv>) {
 		this.#routes = routes;
 		this.#storage = options.storage;
 		this.#env = options.env;
@@ -217,43 +254,72 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 	}
 
 	/**
-	 * Registers a connection. A second `connect` for an id that is already connected drops the previous
-	 * link: its subscriptions are cleared and its `send` is never called again.
+	 * Registers a connection. Reusing a live client ID replaces its link only for the same principal
+	 * (including both anonymous). The returned handle is required for every caller-scoped operation.
 	 */
-	connect(connection: DurableChannelConnection): DurableChannelConnection {
-		this.#links.set(connection.id, { connection, subscriptions: new Set(), watermark: 0 });
+	connect(options: DurableChannelConnectionOptions<TPrincipal>): DurableChannelConnection<TPrincipal> {
+		const principal = options.principal === undefined ? undefined : Object.freeze({ ...options.principal });
+		if (
+			typeof options.id !== "string" || !options.id ||
+			(principal !== undefined && (typeof principal.id !== "string" || principal.id.length === 0))
+		) {
+			throw new PermissionDeniedError();
+		}
+		const previous = this.#links.get(options.id);
+		if (previous !== undefined && previous.connection.principal?.id !== principal?.id) {
+			throw new PermissionDeniedError();
+		}
+		const connection = Object.freeze({ id: options.id, principal }) as DurableChannelConnection<TPrincipal>;
+		// Install the replacement before notifying the old transport: its cleanup cannot remove us.
+		this.#links.set(connection.id, {
+			connection,
+			send: options.send,
+			onDisconnect: options.onDisconnect,
+			subscriptions: new Set(),
+			watermark: 0,
+		});
+		if (previous !== undefined) this.#disconnected(previous);
 		return connection;
 	}
 
-	/** Drops a link. With `connection`, only when it is still the current one for that id. */
-	disconnect(connectionId: string, connection?: DurableChannelConnection): void {
-		const link = this.#links.get(connectionId);
-		if (link === undefined || (connection !== undefined && link.connection !== connection)) {
+	/** Drops this exact link; stale cleanup never affects its replacement. */
+	disconnect(connection: DurableChannelConnection<TPrincipal>): void {
+		const link = this.#links.get(connection.id);
+		if (link === undefined || link.connection !== connection) {
 			return;
 		}
-		this.#links.delete(connectionId);
+		this.#links.delete(connection.id);
+		this.#disconnected(link);
+	}
+
+	#disconnected(link: Link<TPrincipal>): void {
+		link.subscriptions.clear();
+		try {
+			link.onDisconnect?.();
+		} catch { /* Host cleanup must not break registration or a commit. */ }
 	}
 
 	/**
 	 * Subscribes a connection. Returns the snapshot, or `undefined` for a stateless channel. An
 	 * internal route is refused with {@link RouteNotFoundError}, exactly like an unknown one.
 	 */
-	async subscribe(connectionId: string, uri: string): Promise<DurableChannelSnapshot | undefined> {
+	async subscribe(connection: DurableChannelConnection<TPrincipal>, uri: string): Promise<DurableChannelSnapshot | undefined> {
 		await this.ready();
-		const link = this.#link(connectionId);
+		const link = this.#link(connection);
 		const match = this.#reachable(uri);
 		if (match.route.definition.state === undefined) {
 			link.subscriptions.add(uri);
 			return undefined;
 		}
 		const instance = await this.#instance(uri, "subscribe");
+		this.#link(connection);
 		link.subscriptions.add(uri);
 		return { resource: uri, state: instance.state, fromSeq: this.#serverSeq };
 	}
 
-	/** Drops one subscription. Silent when the connection or the subscription is already gone. */
-	unsubscribe(connectionId: string, uri: string): void {
-		this.#links.get(connectionId)?.subscriptions.delete(uri);
+	/** Drops one subscription. Requires a current connection; an absent subscription is a no-op. */
+	unsubscribe(connection: DurableChannelConnection<TPrincipal>, uri: string): void {
+		this.#link(connection).subscriptions.delete(uri);
 	}
 
 	/**
@@ -262,12 +328,16 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 	 * back in `missing` — an unknown route, an internal route and a destroyed instance alike; a
 	 * stateless URI is re-subscribed and listed in neither.
 	 */
-	async reconnect(connectionId: string, lastSeenServerSeq: number, uris: readonly string[]): Promise<DurableChannelReconnectResult> {
+	async reconnect(
+		connection: DurableChannelConnection<TPrincipal>,
+		lastSeenServerSeq: number,
+		uris: readonly string[],
+	): Promise<DurableChannelReconnectResult> {
 		await this.ready();
-		const link = this.#link(connectionId);
+		const link = this.#link(connection);
 		link.subscriptions.clear();
 		const missing: string[] = [];
-		const resumed: Instance<TEnv>[] = [];
+		const resumed: Instance<TEnv, TPrincipal>[] = [];
 		for (const uri of uris) {
 			const match = matchRoute(this.#routes, uri);
 			if (match === undefined || match.route.internal) {
@@ -287,16 +357,21 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 				missing.push(uri);
 				continue;
 			}
+			this.#link(connection);
 			link.subscriptions.add(uri);
 		}
+		this.#link(connection);
+		const identity = connection.principal === undefined ? {} : { principal: { id: connection.principal.id } };
 		if (lastSeenServerSeq === this.#serverSeq || this.#replay.covers(lastSeenServerSeq)) {
 			return {
+				...identity,
 				type: "replay",
 				actions: this.#replay.since(lastSeenServerSeq).filter((envelope) => link.subscriptions.has(envelope.channel)),
 				missing,
 			};
 		}
 		return {
+			...identity,
 			type: "snapshot",
 			snapshots: resumed.map((instance) => ({ resource: instance.uri, state: instance.state, fromSeq: this.#serverSeq })),
 			missing,
@@ -331,7 +406,7 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 	 * thrown error; a missing channel, an internal route or an unknown connection always throws.
 	 */
 	async dispatchFrom(
-		connectionId: string,
+		connection: DurableChannelConnection<TPrincipal>,
 		uri: string,
 		name: string,
 		payload: unknown,
@@ -339,19 +414,24 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 		options?: DurableChannelDispatchOptions,
 	): Promise<DurableChannelEnvelope | undefined> {
 		await this.ready();
-		const link = this.#link(connectionId);
+		const link = this.#link(connection);
 		this.#reachable(uri);
 		const instance = await this.#instance(uri, "dispatch");
+		this.#link(connection);
 		if (clientSeq <= link.watermark) {
 			return undefined;
 		}
 		link.watermark = clientSeq;
-		const origin: DurableChannelActionOrigin = { clientId: connectionId, clientSeq };
+		const origin: DurableChannelActionOrigin = Object.freeze({
+			clientId: connection.id,
+			clientSeq,
+			...(connection.principal === undefined ? {} : { principalId: connection.principal.id }),
+		});
 		const refuse = async (error: DurableChannelError): Promise<DurableChannelEnvelope> => {
 			if (options?.lenient !== true) {
 				throw error;
 			}
-			return await this.#commit(instance, name, payload, origin, reasonOf(error), undefined);
+			return await this.#commit(instance, name, payload, origin, reasonOf(error), undefined, connection);
 		};
 		const action = this.#action(instance, name);
 		if (action === undefined) {
@@ -364,7 +444,7 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 		if (!parsed.success) {
 			return await refuse(new InvalidPayloadError(uri, name));
 		}
-		return await this.#commit(instance, name, parsed.output, origin, undefined, action);
+		return await this.#commit(instance, name, parsed.output, origin, undefined, action, connection);
 	}
 
 	/** Runs a command. Params and result are validated against their schemas. */
@@ -376,7 +456,49 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 	): Promise<InferOutput<TRoutes[TTemplate]["commands"][TName]["result"]>>;
 	exec(uri: string, name: string, params: unknown, options?: DurableChannelExecOptions): Promise<unknown>;
 	async exec(uri: string, name: string, params: unknown, options?: DurableChannelExecOptions): Promise<unknown> {
+		return await this.#exec(uri, name, params, { ...(options?.signal === undefined ? {} : { signal: options.signal }) });
+	}
+
+	/** Runs a remote command using a live connection, hiding internal routes. */
+	execFrom<TTemplate extends keyof TRoutes & string, TName extends keyof TRoutes[TTemplate]["commands"] & string>(
+		connection: DurableChannelConnection<TPrincipal>,
+		uri: TTemplate,
+		name: TName,
+		params: InferInput<TRoutes[TTemplate]["commands"][TName]["params"]>,
+		options?: DurableChannelExecOptions,
+	): Promise<InferOutput<TRoutes[TTemplate]["commands"][TName]["result"]>>;
+	execFrom(
+		connection: DurableChannelConnection<TPrincipal>,
+		uri: string,
+		name: string,
+		params: unknown,
+		options?: DurableChannelExecOptions,
+	): Promise<unknown>;
+	async execFrom(
+		connection: DurableChannelConnection<TPrincipal>,
+		uri: string,
+		name: string,
+		params: unknown,
+		options?: DurableChannelExecOptions,
+	): Promise<unknown> {
+		this.#link(connection);
+		this.#reachable(uri);
+		return await this.#exec(uri, name, params, {
+			connectionId: connection.id,
+			...(connection.principal === undefined ? {} : { principal: connection.principal }),
+			...(options?.signal === undefined ? {} : { signal: options.signal }),
+		}, connection);
+	}
+
+	async #exec(
+		uri: string,
+		name: string,
+		params: unknown,
+		options?: Caller<TPrincipal>,
+		connection?: DurableChannelConnection<TPrincipal>,
+	): Promise<unknown> {
 		await this.ready();
+		if (connection !== undefined) this.#link(connection);
 		const match = this.#match(uri);
 		const definition = match.route.definition;
 		const command = Object.hasOwn(definition.commands, name) ? definition.commands[name] : undefined;
@@ -390,6 +512,7 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 		if (definition.state !== undefined) {
 			await this.#instance(uri, "exec");
 		}
+		if (connection !== undefined) this.#link(connection);
 		const result = await command.handler(parsed.output as never, this.#context(uri, match.params, options));
 		const validated = safeParse(command.result, result);
 		if (!validated.success) {
@@ -511,7 +634,7 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 	}
 
 	/** A typed handle on one template, so a family's instances are addressed by parameters. */
-	of<TTemplate extends keyof TRoutes & string>(template: TTemplate): DurableChannelHandle<TRoutes, TTemplate> {
+	of<TTemplate extends keyof TRoutes & string>(template: TTemplate): DurableChannelHandle<TRoutes, TTemplate, TPrincipal> {
 		const uri = (params: PathToParams<TTemplate>): string => resolveUri(template, params as Record<string, string>);
 		return {
 			uri,
@@ -523,6 +646,8 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 			dispatch: (params, name, payload) => this.dispatch(uri(params), name, payload),
 			notify: (params, name, payload) => this.notify(uri(params), name, payload),
 			exec: (params, name, commandParams, options) => this.exec(uri(params), name, commandParams, options) as never,
+			execFrom: (connection, params, name, commandParams, options) =>
+				this.execFrom(connection, uri(params), name, commandParams, options) as never,
 			list: () => this.list(template) as never,
 		};
 	}
@@ -534,15 +659,15 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 		}
 	}
 
-	#link(connectionId: string): Link {
-		const link = this.#links.get(connectionId);
-		if (link === undefined) {
-			throw new ConnectionNotFoundError(connectionId);
+	#link(connection: DurableChannelConnection<TPrincipal>): Link<TPrincipal> {
+		const link = this.#links.get(connection?.id);
+		if (link === undefined || link.connection !== connection) {
+			throw new ConnectionNotFoundError(connection?.id ?? "<invalid>");
 		}
 		return link;
 	}
 
-	#match(uri: string): DurableChannelRouteMatch<TEnv> {
+	#match(uri: string): DurableChannelRouteMatch<TEnv, TPrincipal> {
 		const match = matchRoute(this.#routes, uri);
 		if (match === undefined) {
 			throw new RouteNotFoundError(uri);
@@ -551,7 +676,7 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 	}
 
 	/** The match a connection is allowed to see: an internal route is as good as no route at all. */
-	#reachable(uri: string): DurableChannelRouteMatch<TEnv> {
+	#reachable(uri: string): DurableChannelRouteMatch<TEnv, TPrincipal> {
 		const match = this.#match(uri);
 		if (match.route.internal) {
 			throw new RouteNotFoundError(uri);
@@ -592,15 +717,22 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 		aborter.abort();
 	}
 
-	#action(instance: Instance<TEnv>, name: string): DurableChannelActionDefinition<unknown, TEnv> | undefined {
+	#action(instance: Instance<TEnv, TPrincipal>, name: string): DurableChannelActionDefinition<unknown, TEnv, TPrincipal> | undefined {
 		const actions = instance.route.definition.actions;
 		return Object.hasOwn(actions, name) ? actions[name] : undefined;
 	}
 
 	/** The instance at `uri`, hydrating it from storage and auto-creating a singleton on first touch. */
-	async #instance(uri: string, operation: string): Promise<Instance<TEnv>> {
+	async #instance(uri: string, operation: string): Promise<Instance<TEnv, TPrincipal>> {
 		const match = this.#match(uri);
-		const definition: DurableChannel<TEnv> = match.route.definition;
+		const definition: DurableChannel<
+			TEnv,
+			unknown,
+			DurableChannelActionMap,
+			DurableChannelCommandMap,
+			DurableChannelNotificationMap,
+			TPrincipal
+		> = match.route.definition;
 		if (definition.state === undefined) {
 			throw new StatelessChannelError(uri, operation);
 		}
@@ -614,7 +746,7 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 			throw new ChannelNotFoundError(uri);
 		}
 		const state = stored === undefined ? definition.initialState : stored;
-		const instance: Instance<TEnv> = { uri, route: match.route, params: match.params, schema: definition.state, state };
+		const instance: Instance<TEnv, TPrincipal> = { uri, route: match.route, params: match.params, schema: definition.state, state };
 		this.#instances.set(uri, instance);
 		if (stored === undefined) {
 			await this.#storage.set(key, state);
@@ -627,7 +759,7 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 	 * caller's connection and abort signal to the nested command, and `background` is bound to `uri`,
 	 * the instance the context belongs to.
 	 */
-	#operations(uri: string, options?: DurableChannelExecOptions): DurableChannelOperations<TEnv> {
+	#operations(uri: string, options?: Caller<TPrincipal>): DurableChannelOperations<TEnv> {
 		return {
 			env: this.#env,
 			dispatch: (target: string, name: string, payload: unknown) => this.dispatch(target, name, payload),
@@ -637,22 +769,23 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 			create: (target: string, state?: unknown) => this.create(target, state),
 			destroy: (target: string) => this.destroy(target),
 			list: (template: string) => this.list(template),
-			exec: (target: string, name: string, commandParams: unknown) =>
-				this.exec(target, name, commandParams, {
-					...(options?.connectionId !== undefined ? { connectionId: options.connectionId } : {}),
-					...(options?.signal !== undefined ? { signal: options.signal } : {}),
-				}),
+			exec: (target: string, name: string, commandParams: unknown) => this.#exec(target, name, commandParams, options),
 			background: (task: (signal: AbortSignal) => void | Promise<void>) => this.#background(uri, task),
 			abortBackground: () => this.#abortBackground(uri),
 		};
 	}
 
-	#context(uri: string, params: Readonly<Record<string, string>>, options?: DurableChannelExecOptions): DurableChannelCommandContext<TEnv> {
+	#context(
+		uri: string,
+		params: Readonly<Record<string, string>>,
+		options?: Caller<TPrincipal>,
+	): DurableChannelCommandContext<TEnv, unknown, DurableChannelActionMap, DurableChannelNotificationMap, TPrincipal> {
 		return {
 			...this.#operations(uri, options),
 			uri,
 			params,
 			connectionId: options?.connectionId,
+			principal: options?.principal,
 			signal: options?.signal ?? new AbortController().signal,
 			state: () => this.get(uri),
 		};
@@ -666,19 +799,25 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 	 * throws propagates to the dispatcher, by which time the envelope is already committed.
 	 */
 	async #commit(
-		instance: Instance<TEnv>,
+		instance: Instance<TEnv, TPrincipal>,
 		name: string,
 		payload: unknown,
 		origin: DurableChannelActionOrigin | undefined,
 		rejectionReason: string | undefined,
-		action: DurableChannelActionDefinition<unknown, TEnv> | undefined,
+		action: DurableChannelActionDefinition<unknown, TEnv, TPrincipal> | undefined,
+		connection?: DurableChannelConnection<TPrincipal>,
 	): Promise<DurableChannelEnvelope> {
 		const committed = await this.#withLock(async () => {
+			if (connection !== undefined) this.#link(connection);
 			let reason = rejectionReason;
 			let state = instance.state;
 			if (reason === undefined && action !== undefined) {
 				try {
-					const reduced = action.reduce(instance.state, payload, { uri: instance.uri, params: instance.params });
+					const reduced = action.reduce(instance.state, payload, {
+						uri: instance.uri,
+						params: instance.params,
+						...(origin !== undefined ? { origin } : {}),
+					});
 					const parsed = safeParse(instance.schema, reduced);
 					if (!parsed.success) {
 						throw new InvalidStateError(instance.uri);
@@ -713,10 +852,17 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 		});
 		if (committed.envelope.rejectionReason === undefined && action?.effect !== undefined) {
 			await action.effect({
-				...this.#operations(instance.uri, origin === undefined ? undefined : { connectionId: origin.clientId }),
+				...this.#operations(
+					instance.uri,
+					connection === undefined ? undefined : {
+						connectionId: connection.id,
+						...(connection.principal === undefined ? {} : { principal: connection.principal }),
+					},
+				),
 				uri: instance.uri,
 				params: instance.params,
 				connectionId: origin?.clientId,
+				principal: connection?.principal,
 				state: committed.state,
 				payload,
 				envelope: committed.envelope,
@@ -731,10 +877,10 @@ export class DurableChannelHub<TEnv = unknown, TRoutes extends DurableChannelRou
 				continue;
 			}
 			try {
-				link.connection.send(message);
+				link.send(message);
 			} catch {
 				// A dead socket must not break a commit; the peer will resubscribe or reconnect.
-				this.#links.delete(link.connection.id);
+				this.disconnect(link.connection);
 			}
 		}
 	}

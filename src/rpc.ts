@@ -14,7 +14,7 @@
  */
 import { Hana, hana, type HanaCollection, JsonRpcError, type JsonRpcRequest, type JsonRpcResponse } from "./hana.ts";
 import * as v from "valibot";
-import type { DurableChannelEnvelope, DurableChannelMessage, DurableChannelSnapshot } from "./channel.ts";
+import type { DurableChannelEnvelope, DurableChannelMessage, DurableChannelPrincipal, DurableChannelSnapshot } from "./channel.ts";
 import { DurableChannelError, NotInitializedError, RejectAction } from "./error.ts";
 import type { DurableChannelConnection, DurableChannelHub } from "./hub.ts";
 import type { DurableChannelRouteMap } from "./routes.ts";
@@ -34,6 +34,10 @@ export const DurableChannelRpcErrorCodes = {
 	ConnectionNotFound: -32004,
 	/** A command refused the call by throwing `RejectAction`. `data` carries `{ reason }`. */
 	ActionRejected: -32005,
+	/** An application operation requires an authenticated caller. */
+	AuthenticationRequired: -32007,
+	/** The application or connection binding denied the operation. */
+	PermissionDenied: -32009,
 	/** No command of that name on the channel. */
 	MethodNotFound: -32601,
 	/** Params, an action payload or a notification payload failed its schema. */
@@ -59,7 +63,7 @@ export const DurableChannelWireEnvelope: v.GenericSchema<DurableChannelEnvelope>
 	name: v.string(),
 	payload: v.unknown(),
 	serverSeq: v.number(),
-	origin: v.exactOptional(v.object({ clientId: v.string(), clientSeq: v.number() })),
+	origin: v.exactOptional(v.object({ clientId: v.string(), clientSeq: v.number(), principalId: v.exactOptional(v.string()) })),
 	rejectionReason: v.exactOptional(v.string()),
 }) as never;
 
@@ -69,13 +73,27 @@ const WireNotification = v.object({
 	payload: v.unknown(),
 });
 
+/** Only public identity crosses the wire; custom principal fields are stripped. */
+export const DurableChannelWirePrincipal = v.object({ id: v.pipe(v.string(), v.minLength(1)) });
+
 const WireReconnectResult = v.variant("type", [
-	v.object({ type: v.literal("replay"), actions: v.array(DurableChannelWireEnvelope), missing: v.array(v.string()) }),
-	v.object({ type: v.literal("snapshot"), snapshots: v.array(DurableChannelWireSnapshot), missing: v.array(v.string()) }),
+	v.object({
+		type: v.literal("replay"),
+		actions: v.array(DurableChannelWireEnvelope),
+		missing: v.array(v.string()),
+		principal: v.exactOptional(DurableChannelWirePrincipal),
+	}),
+	v.object({
+		type: v.literal("snapshot"),
+		snapshots: v.array(DurableChannelWireSnapshot),
+		missing: v.array(v.string()),
+		principal: v.exactOptional(DurableChannelWirePrincipal),
+	}),
 ]);
 
 /** What `hello` answers: the hub's sequence at handshake time and one snapshot per stateful subscription. */
 export interface DurableChannelHelloResult {
+	readonly principal?: DurableChannelPrincipal;
 	readonly serverSeq: number;
 	readonly snapshots: readonly DurableChannelSnapshot[];
 }
@@ -86,30 +104,41 @@ export interface DurableChannelSubscribeResult {
 }
 
 /** Binds one connection to one client id. `hello` and `reconnect` call {@link DurableChannelLink.bind}. */
-export interface DurableChannelLink {
+export interface DurableChannelLink<TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal> {
 	/** The client id this link is bound to, or `undefined` before the first `hello` or `reconnect`. */
 	readonly clientId: string | undefined;
+	readonly connection: DurableChannelConnection<TPrincipal> | undefined;
 	/** Binds the link, dropping whatever binding it had. */
 	bind(clientId: string): void;
+	/** Clears the binding without closing the transport, including after a failed handshake. */
+	unbind(): void;
 }
 
 /** What every procedure of the collection is given: the hub it serves and the caller's link. */
-export interface DurableChannelRpcEnv<TEnv = unknown, TRoutes extends DurableChannelRouteMap = DurableChannelRouteMap> {
-	readonly hub: DurableChannelHub<TEnv, TRoutes>;
-	readonly link: DurableChannelLink;
+export interface DurableChannelRpcEnv<
+	TEnv = unknown,
+	TRoutes extends DurableChannelRouteMap = DurableChannelRouteMap,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
+> {
+	readonly hub: DurableChannelHub<TEnv, TRoutes, TPrincipal>;
+	readonly link: DurableChannelLink<TPrincipal>;
 }
 
 /** A hub's JSON-RPC surface, as {@link createRpc} builds it. */
-export interface DurableChannelRpc<TEnv = unknown, TRoutes extends DurableChannelRouteMap = DurableChannelRouteMap> {
+export interface DurableChannelRpc<
+	TEnv = unknown,
+	TRoutes extends DurableChannelRouteMap = DurableChannelRouteMap,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
+> {
 	/** The hana collection, for a host that wants to merge these procedures into a larger one. */
-	readonly collection: HanaCollection<DurableChannelRpcEnv<TEnv, TRoutes>>;
+	readonly collection: HanaCollection<DurableChannelRpcEnv<TEnv, TRoutes, TPrincipal>>;
 	/** The hana runtime over {@link DurableChannelRpc.collection}. */
-	readonly hana: Hana<DurableChannelRpcEnv<TEnv, TRoutes>>;
+	readonly hana: Hana<DurableChannelRpcEnv<TEnv, TRoutes, TPrincipal>>;
 	/**
 	 * Handles one decoded frame. Answers a response for a request and `undefined` for a notification,
 	 * even when the handler threw.
 	 */
-	handle(frame: unknown, link: DurableChannelLink, signal?: AbortSignal): Promise<JsonRpcResponse | undefined>;
+	handle(frame: unknown, link: DurableChannelLink<TPrincipal>, signal?: AbortSignal): Promise<JsonRpcResponse | undefined>;
 }
 
 /**
@@ -133,6 +162,10 @@ export function toJsonRpcError(error: unknown): JsonRpcError {
 
 function codeFor(code: string): number {
 	switch (code) {
+		case "AUTHENTICATION_REQUIRED":
+			return DurableChannelRpcErrorCodes.AuthenticationRequired;
+		case "PERMISSION_DENIED":
+			return DurableChannelRpcErrorCodes.PermissionDenied;
 		case "ROUTE_NOT_FOUND":
 		case "CHANNEL_NOT_FOUND":
 			return DurableChannelRpcErrorCodes.ChannelNotFound;
@@ -159,11 +192,11 @@ async function guard<T>(task: () => T | Promise<T>): Promise<T> {
 	}
 }
 
-function bound(link: DurableChannelLink): string {
-	if (link.clientId === undefined) {
+function bound<TPrincipal extends DurableChannelPrincipal>(link: DurableChannelLink<TPrincipal>): DurableChannelConnection<TPrincipal> {
+	if (link.connection === undefined) {
 		throw toJsonRpcError(new NotInitializedError());
 	}
-	return link.clientId;
+	return link.connection;
 }
 
 /** Turns a message the hub broadcast into the notification frame a peer expects. */
@@ -204,28 +237,44 @@ export function fromRpcNotification(method: string, params: unknown): DurableCha
  * action, a server-only action and a payload that fails its schema all come back as a rejected envelope
  * every subscriber also sees, instead of an error only the caller learns about.
  */
-export function createRpc<TEnv, TRoutes extends DurableChannelRouteMap>(
-	hub: DurableChannelHub<TEnv, TRoutes>,
-): DurableChannelRpc<TEnv, TRoutes> {
-	type Env = DurableChannelRpcEnv<TEnv, TRoutes>;
+export function createRpc<TEnv, TRoutes extends DurableChannelRouteMap, TPrincipal extends DurableChannelPrincipal>(
+	hub: DurableChannelHub<TEnv, TRoutes, TPrincipal>,
+): DurableChannelRpc<TEnv, TRoutes, TPrincipal> {
+	type Env = DurableChannelRpcEnv<TEnv, TRoutes, TPrincipal>;
 	const collection = hana()
 		.env<Env>()
 		.def((b) =>
 			b.name("hello")
 				.summary("Binds the link to a client id and subscribes it")
 				.params(v.object({ clientId: v.pipe(v.string(), v.minLength(1)), subscriptions: v.optional(v.array(v.string()), []) }))
-				.result(v.object({ serverSeq: v.number(), snapshots: v.array(DurableChannelWireSnapshot) }))
+				.result(
+					v.object({
+						serverSeq: v.number(),
+						snapshots: v.array(DurableChannelWireSnapshot),
+						principal: v.exactOptional(DurableChannelWirePrincipal),
+					}),
+				)
 				.handler(async (params, ctx) =>
 					await guard(async () => {
 						ctx.env.link.bind(params.clientId);
-						const snapshots: DurableChannelSnapshot[] = [];
-						for (const uri of params.subscriptions) {
-							const snapshot = await ctx.env.hub.subscribe(params.clientId, uri);
-							if (snapshot !== undefined) {
-								snapshots.push(snapshot);
+						try {
+							const connection = bound(ctx.env.link);
+							const snapshots: DurableChannelSnapshot[] = [];
+							for (const uri of params.subscriptions) {
+								const snapshot = await ctx.env.hub.subscribe(connection, uri);
+								if (snapshot !== undefined) {
+									snapshots.push(snapshot);
+								}
 							}
+							return {
+								serverSeq: ctx.env.hub.serverSeq,
+								snapshots,
+								...(connection.principal === undefined ? {} : { principal: { id: connection.principal.id } }),
+							};
+						} catch (error) {
+							ctx.env.link.unbind();
+							throw error;
 						}
-						return { serverSeq: ctx.env.hub.serverSeq, snapshots };
 					})
 				)
 		)
@@ -248,10 +297,16 @@ export function createRpc<TEnv, TRoutes extends DurableChannelRouteMap>(
 				.handler(async (params, ctx) =>
 					await guard(async () => {
 						ctx.env.link.bind(params.clientId);
-						const result = await ctx.env.hub.reconnect(params.clientId, params.lastSeenServerSeq, params.subscriptions);
-						return result.type === "replay"
-							? { type: "replay" as const, actions: [...result.actions], missing: [...result.missing] }
-							: { type: "snapshot" as const, snapshots: [...result.snapshots], missing: [...result.missing] };
+						try {
+							const result = await ctx.env.hub.reconnect(bound(ctx.env.link), params.lastSeenServerSeq, params.subscriptions);
+							const identity = result.principal === undefined ? {} : { principal: { id: result.principal.id } };
+							return result.type === "replay"
+								? { ...identity, type: "replay" as const, actions: [...result.actions], missing: [...result.missing] }
+								: { ...identity, type: "snapshot" as const, snapshots: [...result.snapshots], missing: [...result.missing] };
+						} catch (error) {
+							ctx.env.link.unbind();
+							throw error;
+						}
 					})
 				)
 		)
@@ -273,8 +328,10 @@ export function createRpc<TEnv, TRoutes extends DurableChannelRouteMap>(
 				.params(v.object({ channel: v.string() }))
 				.result(v.null())
 				.handler((params, ctx) => {
-					ctx.env.hub.unsubscribe(bound(ctx.env.link), params.channel);
-					return null;
+					return guard(() => {
+						ctx.env.hub.unsubscribe(bound(ctx.env.link), params.channel);
+						return null;
+					});
 				})
 		)
 		.def((b) =>
@@ -306,9 +363,7 @@ export function createRpc<TEnv, TRoutes extends DurableChannelRouteMap>(
 				.params(v.object({ channel: v.string(), name: v.string(), params: v.optional(v.unknown(), {}) }))
 				.result(v.unknown())
 				.handler(async (params, ctx, signal) =>
-					await guard(async () =>
-						await ctx.env.hub.exec(params.channel, params.name, params.params, { connectionId: bound(ctx.env.link), signal })
-					)
+					await guard(async () => await ctx.env.hub.execFrom(bound(ctx.env.link), params.channel, params.name, params.params, { signal }))
 				)
 		)
 		.build();
@@ -328,14 +383,16 @@ export interface DurableChannelSocket {
 }
 
 /** What {@link attachSocket} hands back. */
-export interface DurableChannelSocketSession {
+export interface DurableChannelSocketSession<TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal> {
 	/** The link this socket is bound to, so a host can read the client id it settled on. */
-	readonly link: DurableChannelLink;
+	readonly link: DurableChannelLink<TPrincipal>;
 	/**
 	 * Disconnects the link from the hub and stops answering frames. Called by the socket's own `close`
 	 * and `error` events, and safe to call again.
 	 */
 	detach(): void;
+	/** Host-driven logout, expiry or revocation. Detaches before closing the socket. */
+	close(code?: number, reason?: string): void;
 }
 
 const PARSE_ERROR = JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
@@ -364,13 +421,15 @@ async function textOf(data: unknown): Promise<string> {
  * `notification` frame. This is the whole server side of the protocol; a Hono route, a `Deno.serve`
  * handler and a Durable Object's `fetch` all need nothing more than to hand their socket over.
  */
-export function attachSocket<TEnv, TRoutes extends DurableChannelRouteMap>(
-	rpc: DurableChannelRpc<TEnv, TRoutes>,
-	hub: DurableChannelHub<TEnv, TRoutes>,
+export function attachSocket<TEnv, TRoutes extends DurableChannelRouteMap, TPrincipal extends DurableChannelPrincipal>(
+	rpc: DurableChannelRpc<TEnv, TRoutes, TPrincipal>,
+	hub: DurableChannelHub<TEnv, TRoutes, TPrincipal>,
 	socket: DurableChannelSocket,
-): DurableChannelSocketSession {
+	options?: { readonly principal?: NoInfer<TPrincipal> },
+): DurableChannelSocketSession<TPrincipal> {
 	const aborter = new AbortController();
-	let binding: { clientId: string; connection: DurableChannelConnection } | undefined;
+	const principal = options?.principal === undefined ? undefined : Object.freeze({ ...options.principal });
+	let binding: DurableChannelConnection<TPrincipal> | undefined;
 	let queue: Promise<void> = Promise.resolve();
 	let detached = false;
 	const release = (): void => {
@@ -379,16 +438,30 @@ export function attachSocket<TEnv, TRoutes extends DurableChannelRouteMap>(
 		}
 		const stale = binding;
 		binding = undefined;
-		hub.disconnect(stale.clientId, stale.connection);
+		hub.disconnect(stale);
 	};
-	const link: DurableChannelLink = {
+	const link: DurableChannelLink<TPrincipal> = {
 		get clientId(): string | undefined {
-			return binding?.clientId;
+			return binding?.id;
 		},
+		get connection() {
+			return binding;
+		},
+		unbind: release,
 		bind(clientId: string): void {
+			if (detached) throw new NotInitializedError();
 			release();
-			const connection = hub.connect({ id: clientId, send: (message) => socket.send(JSON.stringify(toRpcNotification(message))) });
-			binding = { clientId, connection };
+			const connection = hub.connect({
+				id: clientId,
+				...(principal === undefined ? {} : { principal }),
+				send: (message) => {
+					if (!detached) socket.send(JSON.stringify(toRpcNotification(message)));
+				},
+				onDisconnect: () => {
+					if (binding === connection) close(1008, "Connection ended");
+				},
+			});
+			binding = connection;
 		},
 	};
 	const detach = (): void => {
@@ -399,6 +472,11 @@ export function attachSocket<TEnv, TRoutes extends DurableChannelRouteMap>(
 		aborter.abort();
 		release();
 	};
+	const close = (code = 1000, reason = ""): void => {
+		if (detached) return;
+		detach();
+		socket.close(code, reason);
+	};
 	const step = async (data: unknown): Promise<void> => {
 		if (detached) {
 			return;
@@ -407,11 +485,12 @@ export function attachSocket<TEnv, TRoutes extends DurableChannelRouteMap>(
 		try {
 			frame = JSON.parse(await textOf(data));
 		} catch {
-			socket.send(PARSE_ERROR);
+			if (!detached) socket.send(PARSE_ERROR);
 			return;
 		}
+		if (detached) return;
 		const response = await rpc.handle(frame, link, aborter.signal);
-		if (response !== undefined) {
+		if (!detached && response !== undefined) {
 			socket.send(JSON.stringify(response));
 		}
 	};
@@ -429,5 +508,5 @@ export function attachSocket<TEnv, TRoutes extends DurableChannelRouteMap>(
 	});
 	on("close", detach);
 	on("error", detach);
-	return { link, detach };
+	return { link, detach, close };
 }

@@ -18,8 +18,11 @@ import type { InferInput, InferOutput } from "valibot";
 import * as v from "valibot";
 import type {
 	DurableChannelActionMap,
+	DurableChannelActionOrigin,
 	DurableChannelCommandMap,
 	DurableChannelEnvelope,
+	DurableChannelMessage,
+	DurableChannelPrincipal,
 	DurableChannelReconnectResult,
 	DurableChannelSnapshot,
 } from "./channel.ts";
@@ -27,8 +30,10 @@ import {
 	ChannelNotFoundError,
 	ClientClosedError,
 	type DurableChannelClientError,
+	IdentityChangedError,
 	InvalidPayloadError,
 	NotClientDispatchableError,
+	NotInitializedError,
 	RouteNotFoundError,
 	RpcError,
 	RpcTimeoutError,
@@ -40,6 +45,7 @@ import {
 	type DurableChannelHelloResult,
 	type DurableChannelRpcFrame,
 	DurableChannelWireEnvelope,
+	DurableChannelWirePrincipal,
 	DurableChannelWireSnapshot,
 	fromRpcNotification,
 } from "./rpc.ts";
@@ -302,6 +308,7 @@ export class DurableChannelSubscription implements AsyncIterableIterator<Durable
 // ─── Internals ───────────────────────────────────────────────────────────────
 
 interface PendingEntry {
+	readonly origin: DurableChannelActionOrigin;
 	readonly clientSeq: number;
 	readonly name: string;
 	readonly payload: unknown;
@@ -309,9 +316,9 @@ interface PendingEntry {
 	settle(outcome: DurableChannelDispatchOutcome): void;
 }
 
-interface Mirror<TEnv> {
+interface Mirror<TEnv, TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal> {
 	readonly uri: string;
-	readonly route: DurableChannelRoute<TEnv>;
+	readonly route: DurableChannelRoute<TEnv, TPrincipal>;
 	readonly params: Readonly<Record<string, string>>;
 	readonly stateful: boolean;
 	readonly events: BroadcastQueue<DurableChannelClientEvent>;
@@ -335,11 +342,25 @@ interface PendingRequest {
 	timer: ReturnType<typeof setTimeout> | undefined;
 }
 
-const HelloResultSchema = v.object({ serverSeq: v.number(), snapshots: v.array(DurableChannelWireSnapshot) });
+const HelloResultSchema = v.object({
+	serverSeq: v.number(),
+	snapshots: v.array(DurableChannelWireSnapshot),
+	principal: v.exactOptional(DurableChannelWirePrincipal),
+});
 const SubscribeResultSchema = v.object({ snapshot: v.optional(DurableChannelWireSnapshot) });
 const ReconnectResultSchema = v.variant("type", [
-	v.object({ type: v.literal("replay"), actions: v.array(DurableChannelWireEnvelope), missing: v.array(v.string()) }),
-	v.object({ type: v.literal("snapshot"), snapshots: v.array(DurableChannelWireSnapshot), missing: v.array(v.string()) }),
+	v.object({
+		type: v.literal("replay"),
+		actions: v.array(DurableChannelWireEnvelope),
+		missing: v.array(v.string()),
+		principal: v.exactOptional(DurableChannelWirePrincipal),
+	}),
+	v.object({
+		type: v.literal("snapshot"),
+		snapshots: v.array(DurableChannelWireSnapshot),
+		missing: v.array(v.string()),
+		principal: v.exactOptional(DurableChannelWirePrincipal),
+	}),
 ]);
 
 function asTransportError(error: unknown): TransportError {
@@ -356,13 +377,22 @@ function asTransportError(error: unknown): TransportError {
  * `confirmed(uri)` is what the server last agreed to, and `reconnect(transport)` resumes on a fresh
  * transport from the sequence the client last saw.
  */
-export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannelRouteMap = DurableChannelRouteMap> {
-	#routes: DurableChannelRoutes<TEnv, TRoutes>;
+export class DurableChannelClient<
+	TEnv = unknown,
+	TRoutes extends DurableChannelRouteMap = DurableChannelRouteMap,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
+> {
+	#routes: DurableChannelRoutes<TEnv, TRoutes, TPrincipal>;
 	#transport: DurableChannelTransport;
 	#clientId: string;
+	#principal: DurableChannelPrincipal | undefined;
+	#initialized = false;
+	#handshakeReady = false;
+	#handshakeMessages: DurableChannelMessage[] = [];
+	#pendingEntries = new Set<PendingEntry>();
 	#requestTimeoutMs: number;
 	#subscriptionBuffer: number;
-	#mirrors = new Map<string, Mirror<TEnv>>();
+	#mirrors = new Map<string, Mirror<TEnv, TPrincipal>>();
 	#subscribed = new Set<string>();
 	#requests = new Map<number, PendingRequest>();
 	#events: BroadcastQueue<DurableChannelClientEventRecord>;
@@ -375,7 +405,7 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 	#done = false;
 
 	constructor(
-		routes: DurableChannelRoutes<TEnv, TRoutes>,
+		routes: DurableChannelRoutes<TEnv, TRoutes, TPrincipal>,
 		transport: DurableChannelTransport,
 		options?: DurableChannelClientOptions,
 	) {
@@ -392,6 +422,11 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 	/** The identity the hub knows this client by, across every transport it reconnects on. */
 	get clientId(): string {
 		return this.#clientId;
+	}
+
+	/** Public identity only. Absence is valid for an initialized anonymous client. */
+	get principal(): DurableChannelPrincipal | undefined {
+		return this.#principal;
 	}
 
 	/** Where the link stands. A transport failure leaves it `closed` until a `reconnect`. */
@@ -461,6 +496,8 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 	 */
 	async hello(args?: { readonly subscriptions?: readonly string[] }): Promise<DurableChannelHelloResult> {
 		this.#assertOpen();
+		this.#handshakeReady = false;
+		this.#handshakeMessages = [];
 		const subscriptions = [...(args?.subscriptions ?? [])];
 		const created: string[] = [];
 		for (const uri of subscriptions) {
@@ -475,6 +512,7 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 		}
 		try {
 			const result = v.parse(HelloResultSchema, await this.#request("hello", { clientId: this.#clientId, subscriptions }));
+			await this.#acceptIdentity(result.principal);
 			this.#see(result.serverSeq);
 			for (const uri of subscriptions) {
 				this.#subscribed.add(uri);
@@ -485,6 +523,7 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 			for (const uri of subscriptions) {
 				this.#primeWithoutSnapshot(uri);
 			}
+			this.#finishHandshake();
 			return result;
 		} catch (error) {
 			for (const uri of created) {
@@ -513,6 +552,8 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 		if (this.#done) {
 			throw new ClientClosedError();
 		}
+		this.#handshakeReady = false;
+		this.#handshakeMessages = [];
 		if (transport !== undefined) {
 			this.#attach(transport);
 		}
@@ -526,6 +567,7 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 			ReconnectResultSchema,
 			await this.#request("reconnect", { clientId: this.#clientId, lastSeenServerSeq: this.#lastSeenServerSeq, subscriptions }),
 		);
+		await this.#acceptIdentity(result.principal);
 		for (const uri of result.missing) {
 			this.#subscribed.delete(uri);
 			this.#forget(uri);
@@ -537,11 +579,14 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 			for (const envelope of result.actions) {
 				this.#inbound(envelope);
 			}
+			// Live echoes received during the handshake also settle pending actions.
+			this.#finishHandshake();
 			for (const mirror of this.#mirrors.values()) {
 				this.#drain(mirror);
 				this.#lose(mirror);
 				this.#restate(mirror);
 			}
+			for (const entry of this.#pendingEntries) entry.settle({ status: "lost" });
 			return result;
 		}
 		const resumed = new Set(result.snapshots.map((snapshot) => snapshot.resource));
@@ -564,6 +609,8 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 			this.#subscribed.delete(uri);
 			this.#forget(uri);
 		}
+		this.#finishHandshake();
+		for (const entry of this.#pendingEntries) entry.settle({ status: "lost" });
 		return result;
 	}
 
@@ -640,6 +687,7 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 	dispatch(uri: string, name: string, payload: unknown): DurableChannelDispatchHandle;
 	dispatch(uri: string, name: string, payload: unknown): DurableChannelDispatchHandle {
 		this.#assertOpen();
+		if (!this.#handshakeReady) throw new NotInitializedError();
 		const match = matchRoute(this.#routes, uri);
 		if (match === undefined) {
 			throw new RouteNotFoundError(uri);
@@ -665,18 +713,25 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 			resolve = next;
 		});
 		const entry: PendingEntry = {
+			origin: Object.freeze({
+				clientId: this.#clientId,
+				clientSeq,
+				...(this.#principal === undefined ? {} : { principalId: this.#principal.id }),
+			}),
 			clientSeq,
 			name,
 			payload,
 			settled: false,
-			settle(outcome) {
+			settle: (outcome) => {
 				if (entry.settled) {
 					return;
 				}
 				entry.settled = true;
+				this.#pendingEntries.delete(entry);
 				resolve(outcome);
 			},
 		};
+		this.#pendingEntries.add(entry);
 		const mirror = this.#mirrors.get(uri);
 		if (mirror !== undefined) {
 			mirror.pending.push(entry);
@@ -741,7 +796,7 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 
 	// ─── State ─────────────────────────────────────────────────────────────────
 
-	#stateful(uri: string): Mirror<TEnv> {
+	#stateful(uri: string): Mirror<TEnv, TPrincipal> {
 		const mirror = this.#mirrors.get(uri);
 		if (mirror === undefined) {
 			throw new ChannelNotFoundError(uri);
@@ -752,13 +807,13 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 		return mirror;
 	}
 
-	#mirror(uri: string): Mirror<TEnv> {
+	#mirror(uri: string): Mirror<TEnv, TPrincipal> {
 		const match = matchRoute(this.#routes, uri);
 		if (match === undefined) {
 			throw new RouteNotFoundError(uri);
 		}
 		const definition = match.route.definition;
-		const mirror: Mirror<TEnv> = {
+		const mirror: Mirror<TEnv, TPrincipal> = {
 			uri,
 			route: match.route,
 			params: match.params,
@@ -786,7 +841,7 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 	}
 
 	/** Settles every action still pending on a channel as `lost` and drops it from the optimistic state. */
-	#lose(mirror: Mirror<TEnv>): void {
+	#lose(mirror: Mirror<TEnv, TPrincipal>): void {
 		const pending = mirror.pending.splice(0);
 		for (const entry of pending) {
 			entry.settle({ status: "lost" });
@@ -798,7 +853,13 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 	}
 
 	/** Runs one action's reducer, or hands the state back untouched when it cannot. */
-	#reduce(mirror: Mirror<TEnv>, state: unknown, name: string, payload: unknown): unknown {
+	#reduce(
+		mirror: Mirror<TEnv, TPrincipal>,
+		state: unknown,
+		name: string,
+		payload: unknown,
+		origin: DurableChannelActionOrigin | undefined,
+	): unknown {
 		const actions = mirror.route.definition.actions;
 		if (!Object.hasOwn(actions, name)) {
 			return state;
@@ -809,7 +870,7 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 			return state;
 		}
 		try {
-			return action.reduce(state, parsed.output, { uri: mirror.uri, params: mirror.params });
+			return action.reduce(state, parsed.output, { uri: mirror.uri, params: mirror.params, ...(origin !== undefined ? { origin } : {}) });
 		} catch {
 			// A refusal, or a reducer that disagrees with the server's: the confirmed state is the truth.
 			return state;
@@ -820,13 +881,13 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 	 * Recomputes the optimistic state and announces it, but only when something really moved — unless
 	 * `force`, which a snapshot needs because it restates the channel whether the value differs or not.
 	 */
-	#restate(mirror: Mirror<TEnv>, force = false): void {
+	#restate(mirror: Mirror<TEnv, TPrincipal>, force = false): void {
 		if (!mirror.stateful) {
 			return;
 		}
 		let optimistic = mirror.confirmed;
 		for (const entry of mirror.pending) {
-			optimistic = this.#reduce(mirror, optimistic, entry.name, entry.payload);
+			optimistic = this.#reduce(mirror, optimistic, entry.name, entry.payload, entry.origin);
 		}
 		if (!force && optimistic === mirror.optimistic) {
 			return;
@@ -861,7 +922,7 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 		this.#restate(mirror);
 	}
 
-	#drain(mirror: Mirror<TEnv>): void {
+	#drain(mirror: Mirror<TEnv, TPrincipal>): void {
 		const buffered = mirror.buffered.splice(0);
 		for (const envelope of buffered) {
 			this.#reconcile(mirror, envelope);
@@ -883,8 +944,10 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 		this.#reconcile(mirror, envelope);
 	}
 
-	#reconcile(mirror: Mirror<TEnv>, envelope: DurableChannelEnvelope): void {
-		const own = envelope.origin?.clientId === this.#clientId ? envelope.origin : undefined;
+	#reconcile(mirror: Mirror<TEnv, TPrincipal>, envelope: DurableChannelEnvelope): void {
+		const own = envelope.origin?.clientId === this.#clientId && envelope.origin?.principalId === this.#principal?.id
+			? envelope.origin
+			: undefined;
 		if (own !== undefined) {
 			const settled: PendingEntry[] = [];
 			mirror.pending = mirror.pending.filter((entry) => {
@@ -906,7 +969,7 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 		this.#see(envelope.serverSeq);
 		this.#publish(mirror.uri, { type: "action", envelope });
 		if (envelope.rejectionReason === undefined) {
-			mirror.confirmed = this.#reduce(mirror, mirror.confirmed, envelope.name, envelope.payload);
+			mirror.confirmed = this.#reduce(mirror, mirror.confirmed, envelope.name, envelope.payload, envelope.origin);
 		}
 		this.#restate(mirror);
 	}
@@ -962,16 +1025,46 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 
 	#attach(transport: DurableChannelTransport): void {
 		this.#failRequests(new TransportError("closed", "The transport was replaced"));
+		const previous = this.#transport;
 		this.#transport = transport;
+		if (previous !== transport) void Promise.resolve().then(() => previous.close()).catch(() => {});
 		this.#loop = undefined;
 		this.#setState({ status: "connected" });
 		this.#loop = this.#drive(transport);
+	}
+
+	async #acceptIdentity(principal: DurableChannelPrincipal | undefined): Promise<void> {
+		if (this.#initialized && this.#principal?.id !== principal?.id) {
+			const error = new IdentityChangedError();
+			for (const entry of this.#pendingEntries) entry.settle({ status: "lost", error });
+			for (const uri of this.#mirrors.keys()) this.#forget(uri);
+			this.#subscribed.clear();
+			this.#handshakeMessages = [];
+			this.#principal = undefined;
+			await this.shutdown();
+			throw error;
+		}
+		this.#principal = principal === undefined ? undefined : Object.freeze({ id: principal.id });
+		this.#initialized = true;
+	}
+
+	#finishHandshake(): void {
+		this.#handshakeReady = true;
+		const messages = this.#handshakeMessages;
+		this.#handshakeMessages = [];
+		for (const message of messages) this.#message(message);
+	}
+
+	#message(message: DurableChannelMessage): void {
+		if (message.type === "action") this.#inbound(message);
+		else this.#publish(message.channel, { type: "notification", channel: message.channel, name: message.name, payload: message.payload });
 	}
 
 	async #drive(transport: DurableChannelTransport): Promise<void> {
 		try {
 			while (this.#transport === transport && this.#state.status === "connected") {
 				const frame = await transport.recv();
+				if (this.#transport !== transport || this.#state.status !== "connected") return;
 				if (frame === null) {
 					if (this.#transport === transport) {
 						this.#tearDown({ type: "transport", error: new TransportError("closed", "The transport closed") });
@@ -1001,16 +1094,8 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 			if (message === undefined) {
 				return;
 			}
-			if (message.type === "action") {
-				this.#inbound(message);
-				return;
-			}
-			this.#publish(message.channel, {
-				type: "notification",
-				channel: message.channel,
-				name: message.name,
-				payload: message.payload,
-			});
+			if (!this.#handshakeReady) this.#handshakeMessages.push(message);
+			else this.#message(message);
 			return;
 		}
 		if (typeof id !== "number") {
@@ -1093,11 +1178,14 @@ export class DurableChannelClient<TEnv = unknown, TRoutes extends DurableChannel
 			return;
 		}
 		this.#setState({ status: "closed", reason });
+		this.#handshakeReady = false;
+		this.#handshakeMessages = [];
 		if (reason.type === "transport") {
 			this.#failRequests(reason.error);
 			return;
 		}
 		this.#done = true;
+		for (const entry of this.#pendingEntries) entry.settle({ status: "lost" });
 		this.#failRequests(new ClientClosedError());
 		for (const mirror of this.#mirrors.values()) {
 			this.#lose(mirror);

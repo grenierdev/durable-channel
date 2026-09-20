@@ -224,8 +224,8 @@ describe("DurableChannelHub", () => {
 	it("auto-creates a singleton on first touch and snapshots it at the current sequence", async () => {
 		const { hub, storage } = boot();
 		const alice = spy("alice");
-		hub.connect(alice.connection);
-		assertEquals(await hub.subscribe("alice", "counter://"), { resource: "counter://", state: { count: 0 }, fromSeq: 0 });
+		const aliceConnection = hub.connect(alice.connection);
+		assertEquals(await hub.subscribe(aliceConnection, "counter://"), { resource: "counter://", state: { count: 0 }, fromSeq: 0 });
 		assertEquals(await storage.get(["channel", "counter://", "counter://"]), { count: 0 });
 		assertEquals(await hub.has("counter://"), true);
 		assertEquals(await hub.has("nope://"), false);
@@ -233,19 +233,19 @@ describe("DurableChannelHub", () => {
 
 	it("refuses an unknown route, a missing instance and an unknown connection", async () => {
 		const { hub } = boot();
-		hub.connect(spy("alice").connection);
-		await assertRejects(() => hub.subscribe("alice", "nope://"), RouteNotFoundError);
-		await assertRejects(() => hub.subscribe("alice", "doc:/1"), ChannelNotFoundError);
-		await assertRejects(() => hub.subscribe("ghost", "counter://"), ConnectionNotFoundError);
+		const aliceConnection = hub.connect(spy("alice").connection);
+		await assertRejects(() => hub.subscribe(aliceConnection, "nope://"), RouteNotFoundError);
+		await assertRejects(() => hub.subscribe(aliceConnection, "doc:/1"), ChannelNotFoundError);
+		await assertRejects(() => hub.subscribe({ id: "ghost" } as never, "counter://"), ConnectionNotFoundError);
 	});
 
 	it("broadcasts a server dispatch to subscribers only and bumps one global sequence", async () => {
 		const { hub } = boot();
 		const alice = spy("alice");
 		const bob = spy("bob");
-		hub.connect(alice.connection);
-		hub.connect(bob.connection);
-		await hub.subscribe("alice", "counter://");
+		const aliceConnection = hub.connect(alice.connection);
+		const bobConnection = hub.connect(bob.connection);
+		await hub.subscribe(aliceConnection, "counter://");
 		const envelope = await hub.dispatch("counter://", "counter/incremented", { by: 2 });
 		assertEquals(envelope, { type: "action", channel: "counter://", name: "counter/incremented", payload: { by: 2 }, serverSeq: 1 });
 		assertEquals(hub.serverSeq, 1);
@@ -259,26 +259,29 @@ describe("DurableChannelHub", () => {
 	it("stamps a client dispatch with its origin and honours the client flag", async () => {
 		const { hub } = boot();
 		const alice = spy("alice");
-		hub.connect(alice.connection);
-		await hub.subscribe("alice", "counter://");
-		const envelope = await hub.dispatchFrom("alice", "counter://", "counter/incremented", { by: 3 }, 1);
+		const aliceConnection = hub.connect(alice.connection);
+		await hub.subscribe(aliceConnection, "counter://");
+		const envelope = await hub.dispatchFrom(aliceConnection, "counter://", "counter/incremented", { by: 3 }, 1);
 		assertEquals(envelope?.origin, { clientId: "alice", clientSeq: 1 });
-		await assertRejects(() => hub.dispatchFrom("alice", "counter://", "counter/reset", { to: 0 }, 2), NotClientDispatchableError);
-		await assertRejects(() => hub.dispatchFrom("alice", "counter://", "counter/nope", {}, 3), UnknownActionError);
-		await assertRejects(() => hub.dispatchFrom("alice", "counter://", "counter/incremented", { by: "x" }, 4), InvalidPayloadError);
-		await assertRejects(() => hub.dispatchFrom("ghost", "counter://", "counter/incremented", { by: 1 }, 1), ConnectionNotFoundError);
+		await assertRejects(() => hub.dispatchFrom(aliceConnection, "counter://", "counter/reset", { to: 0 }, 2), NotClientDispatchableError);
+		await assertRejects(() => hub.dispatchFrom(aliceConnection, "counter://", "counter/nope", {}, 3), UnknownActionError);
+		await assertRejects(() => hub.dispatchFrom(aliceConnection, "counter://", "counter/incremented", { by: "x" }, 4), InvalidPayloadError);
+		await assertRejects(
+			() => hub.dispatchFrom({ id: "ghost" } as never, "counter://", "counter/incremented", { by: 1 }, 1),
+			ConnectionNotFoundError,
+		);
 	});
 
 	it("turns an unacceptable client dispatch into a rejected echo when lenient", async () => {
 		const { hub } = boot();
 		const alice = spy("alice");
-		hub.connect(alice.connection);
-		await hub.subscribe("alice", "counter://");
+		const aliceConnection = hub.connect(alice.connection);
+		await hub.subscribe(aliceConnection, "counter://");
 		const lenient = { lenient: true };
-		const unknown = await hub.dispatchFrom("alice", "counter://", "counter/nope", {}, 1, lenient);
-		const serverOnly = await hub.dispatchFrom("alice", "counter://", "counter/reset", { to: 5 }, 2, lenient);
-		const badPayload = await hub.dispatchFrom("alice", "counter://", "counter/incremented", { by: "x" }, 3, lenient);
-		const refused = await hub.dispatchFrom("alice", "counter://", "counter/incremented", { by: -1 }, 4, lenient);
+		const unknown = await hub.dispatchFrom(aliceConnection, "counter://", "counter/nope", {}, 1, lenient);
+		const serverOnly = await hub.dispatchFrom(aliceConnection, "counter://", "counter/reset", { to: 5 }, 2, lenient);
+		const badPayload = await hub.dispatchFrom(aliceConnection, "counter://", "counter/incremented", { by: "x" }, 3, lenient);
+		const refused = await hub.dispatchFrom(aliceConnection, "counter://", "counter/incremented", { by: -1 }, 4, lenient);
 		assert(unknown?.rejectionReason?.startsWith("UNKNOWN_ACTION"));
 		assert(serverOnly?.rejectionReason?.startsWith("NOT_CLIENT_DISPATCHABLE"));
 		assert(badPayload?.rejectionReason?.startsWith("INVALID_PAYLOAD"));
@@ -290,11 +293,11 @@ describe("DurableChannelHub", () => {
 
 	it("ignores a clientSeq that is not greater than the link's watermark", async () => {
 		const { hub } = boot();
-		hub.connect(spy("alice").connection);
-		await hub.subscribe("alice", "counter://");
-		assert(await hub.dispatchFrom("alice", "counter://", "counter/incremented", { by: 1 }, 4) !== undefined);
-		assertEquals(await hub.dispatchFrom("alice", "counter://", "counter/incremented", { by: 1 }, 4), undefined);
-		assertEquals(await hub.dispatchFrom("alice", "counter://", "counter/incremented", { by: 1 }, 2), undefined);
+		const aliceConnection = hub.connect(spy("alice").connection);
+		await hub.subscribe(aliceConnection, "counter://");
+		assert(await hub.dispatchFrom(aliceConnection, "counter://", "counter/incremented", { by: 1 }, 4) !== undefined);
+		assertEquals(await hub.dispatchFrom(aliceConnection, "counter://", "counter/incremented", { by: 1 }, 4), undefined);
+		assertEquals(await hub.dispatchFrom(aliceConnection, "counter://", "counter/incremented", { by: 1 }, 2), undefined);
 		assertEquals(hub.serverSeq, 1);
 		assertEquals(await hub.get("counter://"), { count: 1 });
 	});
@@ -302,8 +305,8 @@ describe("DurableChannelHub", () => {
 	it("gives a command parsed params, a typed result, and the right to dispatch and notify", async () => {
 		const { hub } = boot();
 		const alice = spy("alice");
-		hub.connect(alice.connection);
-		await hub.subscribe("alice", "counter://");
+		const aliceConnection = hub.connect(alice.connection);
+		await hub.subscribe(aliceConnection, "counter://");
 		await hub.dispatch("counter://", "counter/incremented", { by: 9 });
 		assertEquals(await hub.exec("counter://", "reset", {}), { count: 0, at: "2026-09-07T00:00:00.000Z" });
 		assertEquals(await hub.get("counter://"), { count: 0 });
@@ -320,8 +323,8 @@ describe("DurableChannelHub", () => {
 
 	it("never stores a notification", async () => {
 		const { hub, storage } = boot();
-		hub.connect(spy("alice").connection);
-		await hub.subscribe("alice", "counter://");
+		const aliceConnection = hub.connect(spy("alice").connection);
+		await hub.subscribe(aliceConnection, "counter://");
 		await hub.notify("counter://", "counter/announced", { text: "hi" });
 		assertEquals(hub.serverSeq, 0);
 		const page = await storage.list({ prefix: ["channel"] });
@@ -355,21 +358,21 @@ describe("DurableChannelHub", () => {
 	it("destroys an instance, its storage key, its subscriptions and its resumability", async () => {
 		const { hub, storage } = boot();
 		const alice = spy("alice");
-		hub.connect(alice.connection);
+		const aliceConnection = hub.connect(alice.connection);
 		await hub.create("doc:/1");
-		await hub.subscribe("alice", "doc:/1");
-		await hub.subscribe("alice", "counter://");
+		await hub.subscribe(aliceConnection, "doc:/1");
+		await hub.subscribe(aliceConnection, "counter://");
 		await hub.destroy("doc:/1");
 		assertEquals(await hub.has("doc:/1"), false);
 		assertEquals((await storage.list({ prefix: ["channel", "doc:/:id"] })).entries, []);
-		assertEquals(await hub.reconnect("alice", hub.serverSeq, ["counter://", "doc:/1"]), {
+		assertEquals(await hub.reconnect(aliceConnection, hub.serverSeq, ["counter://", "doc:/1"]), {
 			type: "replay",
 			actions: [],
 			missing: ["doc:/1"],
 		});
 		await hub.dispatch("counter://", "counter/incremented", { by: 1 });
 		assertEquals(alice.received.map((message) => message.channel), ["counter://"]);
-		await assertRejects(() => hub.subscribe("alice", "doc:/1"), ChannelNotFoundError);
+		await assertRejects(() => hub.subscribe(aliceConnection, "doc:/1"), ChannelNotFoundError);
 		await assertRejects(() => hub.dispatch("doc:/1", "doc/renamed", { title: "x" }), ChannelNotFoundError);
 		await assertRejects(() => hub.get("doc:/1"), ChannelNotFoundError);
 	});
@@ -377,10 +380,10 @@ describe("DurableChannelHub", () => {
 	it("runs an accepted action's effect, and none of a rejected one", async () => {
 		const { hub } = boot();
 		const alice = spy("alice");
-		hub.connect(alice.connection);
+		const aliceConnection = hub.connect(alice.connection);
 		await hub.create("doc:/1");
-		await hub.subscribe("alice", "doc:/1");
-		await hub.subscribe("alice", "catalog://");
+		await hub.subscribe(aliceConnection, "doc:/1");
+		await hub.subscribe(aliceConnection, "catalog://");
 		const renamed = await hub.dispatch("doc:/1", "doc/renamed", { title: "Final" });
 		assertEquals(alice.received, [
 			renamed,
@@ -422,8 +425,8 @@ describe("DurableChannelHub", () => {
 			storage: new MemoryStorage(),
 			env: { now: () => "2026-09-07T00:00:00.000Z" },
 		});
-		watched.connect(spy("alice").connection);
-		await watched.dispatchFrom("alice", "watch://", "watch/hit", {}, 1);
+		const aliceConnection = watched.connect(spy("alice").connection);
+		await watched.dispatchFrom(aliceConnection, "watch://", "watch/hit", {}, 1);
 		await watched.dispatch("watch://", "watch/hit", {});
 		assertEquals(seen, ["alice", undefined]);
 		assertEquals(await watched.get("watch://"), { hits: 2 });
@@ -433,9 +436,9 @@ describe("DurableChannelHub", () => {
 	it("lets a command create an instance of another template and dispatch to it", async () => {
 		const { hub } = boot();
 		const alice = spy("alice");
-		hub.connect(alice.connection);
-		await hub.subscribe("alice", "catalog://");
-		assertEquals(await hub.exec("catalog://", "createDoc", { id: "7", title: "Seven" }, { connectionId: "alice" }), {
+		const aliceConnection = hub.connect(alice.connection);
+		await hub.subscribe(aliceConnection, "catalog://");
+		assertEquals(await hub.execFrom(aliceConnection, "catalog://", "createDoc", { id: "7", title: "Seven" }), {
 			uri: "doc:/7",
 			by: "alice",
 		});
@@ -452,24 +455,30 @@ describe("DurableChannelHub", () => {
 	it("forwards the caller's connection and abort signal to a nested command", async () => {
 		const { hub } = boot();
 		await hub.create("doc:/1");
-		assertEquals(await hub.exec("catalog://", "stampDoc", { id: "1" }, { connectionId: "alice" }), { by: "alice", aborted: false });
+		assertEquals(await hub.execFrom(hub.connect(spy("alice").connection), "catalog://", "stampDoc", { id: "1" }), {
+			by: "alice",
+			aborted: false,
+		});
 		assertEquals(await hub.exec("catalog://", "stampDoc", { id: "1" }), { by: "server", aborted: false });
 		const aborter = new AbortController();
 		aborter.abort();
-		assertEquals(await hub.exec("catalog://", "stampDoc", { id: "1" }, { connectionId: "bob", signal: aborter.signal }), {
-			by: "bob",
-			aborted: true,
-		});
+		assertEquals(
+			await hub.execFrom(hub.connect(spy("bob").connection), "catalog://", "stampDoc", { id: "1" }, { signal: aborter.signal }),
+			{
+				by: "bob",
+				aborted: true,
+			},
+		);
 	});
 
 	it("hides an internal route from every connection but not from the hub", async () => {
 		const { hub } = boot();
 		const alice = spy("alice");
-		hub.connect(alice.connection);
-		await assertRejects(() => hub.subscribe("alice", "x-index://"), RouteNotFoundError);
-		await assertRejects(() => hub.dispatchFrom("alice", "x-index://", "index/hit", {}, 1, { lenient: true }), RouteNotFoundError);
-		await hub.subscribe("alice", "counter://");
-		assertEquals(await hub.reconnect("alice", hub.serverSeq, ["counter://", "x-index://"]), {
+		const aliceConnection = hub.connect(alice.connection);
+		await assertRejects(() => hub.subscribe(aliceConnection, "x-index://"), RouteNotFoundError);
+		await assertRejects(() => hub.dispatchFrom(aliceConnection, "x-index://", "index/hit", {}, 1, { lenient: true }), RouteNotFoundError);
+		await hub.subscribe(aliceConnection, "counter://");
+		assertEquals(await hub.reconnect(aliceConnection, hub.serverSeq, ["counter://", "x-index://"]), {
 			type: "replay",
 			actions: [],
 			missing: ["x-index://"],
@@ -525,8 +534,8 @@ describe("DurableChannelHub", () => {
 	it("treats every URI of a stateless route as existing and pushes only notifications", async () => {
 		const { hub, storage } = boot();
 		const alice = spy("alice");
-		hub.connect(alice.connection);
-		assertEquals(await hub.subscribe("alice", "log:/build"), undefined);
+		const aliceConnection = hub.connect(alice.connection);
+		assertEquals(await hub.subscribe(aliceConnection, "log:/build"), undefined);
 		assertEquals(await hub.has("log:/build"), true);
 		assertEquals(await hub.exec("log:/build", "append", { line: "compiled" }), null);
 		assertEquals(alice.received, [{
@@ -550,41 +559,41 @@ describe("DurableChannelHub", () => {
 	it("replays, snapshots or reports missing on reconnect", async () => {
 		const { hub } = boot({ replayLimit: 2 });
 		const alice = spy("alice");
-		hub.connect(alice.connection);
-		await hub.subscribe("alice", "counter://");
+		const aliceConnection = hub.connect(alice.connection);
+		await hub.subscribe(aliceConnection, "counter://");
 		await hub.dispatch("counter://", "counter/incremented", { by: 1 });
-		const caughtUp = await hub.reconnect("alice", 1, ["counter://", "log:/build", "nope://", "doc:/9"]);
+		const caughtUp = await hub.reconnect(aliceConnection, 1, ["counter://", "log:/build", "nope://", "doc:/9"]);
 		assertEquals(caughtUp, { type: "replay", actions: [], missing: ["nope://", "doc:/9"] });
 
 		await hub.dispatch("counter://", "counter/incremented", { by: 1 });
-		const replayed = await hub.reconnect("alice", 1, ["counter://"]);
+		const replayed = await hub.reconnect(aliceConnection, 1, ["counter://"]);
 		assertEquals(replayed.type === "replay" ? replayed.actions.map((envelope) => envelope.serverSeq) : [], [2]);
 
 		await hub.dispatch("counter://", "counter/incremented", { by: 1 });
 		await hub.dispatch("counter://", "counter/incremented", { by: 1 });
-		const snapshotted = await hub.reconnect("alice", 1, ["counter://", "log:/build"]);
+		const snapshotted = await hub.reconnect(aliceConnection, 1, ["counter://", "log:/build"]);
 		assertEquals(snapshotted, { type: "snapshot", snapshots: [{ resource: "counter://", state: { count: 4 }, fromSeq: 4 }], missing: [] });
 	});
 
 	it("replaces a link when the same id connects twice", async () => {
 		const { hub } = boot();
 		const first = spy("alice");
-		hub.connect(first.connection);
-		await hub.subscribe("alice", "counter://");
+		const firstConnection = hub.connect(first.connection);
+		await hub.subscribe(firstConnection, "counter://");
 		const second = spy("alice");
-		hub.connect(second.connection);
+		const secondConnection = hub.connect(second.connection);
 		await hub.dispatch("counter://", "counter/incremented", { by: 1 });
 		assertEquals(first.received, []);
 		assertEquals(second.received, []);
-		await hub.subscribe("alice", "counter://");
+		await hub.subscribe(secondConnection, "counter://");
 		await hub.dispatch("counter://", "counter/incremented", { by: 1 });
 		assertEquals(first.received, []);
 		assertEquals(second.received.length, 1);
 
-		hub.disconnect("alice", first.connection);
+		hub.disconnect(firstConnection);
 		await hub.dispatch("counter://", "counter/incremented", { by: 1 });
 		assertEquals(second.received.length, 2);
-		hub.disconnect("alice", second.connection);
+		hub.disconnect(secondConnection);
 		await hub.dispatch("counter://", "counter/incremented", { by: 1 });
 		assertEquals(second.received.length, 2);
 	});
@@ -592,8 +601,8 @@ describe("DurableChannelHub", () => {
 	it("keeps state and the sequence on Deno KV across a restart", async () => {
 		using storage = await DenoKvStorage.open(":memory:");
 		const first = boot({ storage });
-		first.hub.connect(spy("alice").connection);
-		await first.hub.subscribe("alice", "counter://");
+		const aliceConnection = first.hub.connect(spy("alice").connection);
+		await first.hub.subscribe(aliceConnection, "counter://");
 		await first.hub.dispatch("counter://", "counter/incremented", { by: 6 });
 		await first.hub.create("doc:/kv", { title: "persisted" });
 		assertEquals(await storage.get(["hub", "serverSeq"]), 1);
@@ -616,8 +625,8 @@ describe("DurableChannelHub", () => {
 	it("persists state and the sequence, and hydrates a fresh hub from the same storage", async () => {
 		const storage = new MemoryStorage();
 		const first = boot({ storage });
-		first.hub.connect(spy("alice").connection);
-		await first.hub.subscribe("alice", "counter://");
+		const aliceConnection = first.hub.connect(spy("alice").connection);
+		await first.hub.subscribe(aliceConnection, "counter://");
 		await first.hub.dispatch("counter://", "counter/incremented", { by: 4 });
 		assertEquals(await storage.get(["channel", "counter://", "counter://"]), { count: 4 });
 		assertEquals(await storage.get(["hub", "serverSeq"]), 1);
@@ -627,8 +636,8 @@ describe("DurableChannelHub", () => {
 		await second.hub.ready();
 		assertEquals(second.hub.serverSeq, 1);
 		assertEquals(await second.hub.get("counter://"), { count: 4 });
-		second.hub.connect(spy("alice").connection);
-		assertEquals(await second.hub.reconnect("alice", 0, ["counter://"]), {
+		const secondAliceConnection = second.hub.connect(spy("alice").connection);
+		assertEquals(await second.hub.reconnect(secondAliceConnection, 0, ["counter://"]), {
 			type: "snapshot",
 			snapshots: [{ resource: "counter://", state: { count: 4 }, fromSeq: 1 }],
 			missing: [],

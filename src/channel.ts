@@ -16,10 +16,16 @@ import { InvalidDefinitionError, InvalidStateError } from "./error.ts";
 
 // ─── Messages ────────────────────────────────────────────────────────────────
 
+/** Trusted identity supplied by the host. Custom fields stay on the server. */
+export interface DurableChannelPrincipal {
+	readonly id: string;
+}
+
 /** The connection that dispatched an action, and its own sequence number for it. */
 export interface DurableChannelActionOrigin {
 	readonly clientId: string;
 	readonly clientSeq: number;
+	readonly principalId?: string;
 }
 
 /** A committed action. Carries `rejectionReason` when the hub refused it and left the state untouched. */
@@ -53,8 +59,18 @@ export interface DurableChannelSnapshot {
 
 /** What a reconnect could restore. `missing` lists the URIs the hub cannot resume. */
 export type DurableChannelReconnectResult =
-	| { readonly type: "replay"; readonly actions: readonly DurableChannelEnvelope[]; readonly missing: readonly string[] }
-	| { readonly type: "snapshot"; readonly snapshots: readonly DurableChannelSnapshot[]; readonly missing: readonly string[] };
+	| {
+		readonly type: "replay";
+		readonly actions: readonly DurableChannelEnvelope[];
+		readonly missing: readonly string[];
+		readonly principal?: DurableChannelPrincipal;
+	}
+	| {
+		readonly type: "snapshot";
+		readonly snapshots: readonly DurableChannelSnapshot[];
+		readonly missing: readonly string[];
+		readonly principal?: DurableChannelPrincipal;
+	};
 
 /** One live instance of a route. */
 export interface DurableChannelInstance<TState = unknown> {
@@ -78,12 +94,18 @@ export type DurableChannelNotificationMap = Record<string, GenericSchema>;
 
 /** What a reducer knows about where it runs. Deliberately no `env`, no clock and no randomness. */
 export interface DurableChannelActionMeta {
+	/** The committed envelope origin; absent for server dispatches. Also supplied during optimistic reduction. */
+	readonly origin?: DurableChannelActionOrigin;
 	readonly uri: string;
 	readonly params: Readonly<Record<string, string>>;
 }
 
 /** A named mutation: a payload schema, a pure synchronous reducer, and an optional server-side effect. */
-export interface DurableChannelActionDefinition<TState = unknown, TEnv = unknown> {
+export interface DurableChannelActionDefinition<
+	TState = unknown,
+	TEnv = unknown,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
+> {
 	readonly name: string;
 	/** A one-line description, for the generated document. */
 	readonly summary?: string;
@@ -95,17 +117,20 @@ export interface DurableChannelActionDefinition<TState = unknown, TEnv = unknown
 	 * Server-side work to run once the action is committed and broadcast. Never part of the isomorphic
 	 * surface: a client running the same definition ignores it.
 	 */
-	readonly effect?: (ctx: DurableChannelActionEffectContext<TEnv, TState>) => void | Promise<void>;
+	readonly effect?: (ctx: DurableChannelActionEffectContext<TEnv, TState, unknown, TPrincipal>) => void | Promise<void>;
 }
 
 /** A named procedure. Its handler receives the parsed params and may do side effects. */
-export interface DurableChannelCommandDefinition<TEnv = unknown> {
+export interface DurableChannelCommandDefinition<TEnv = unknown, TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal> {
 	readonly name: string;
 	/** A one-line description, for the generated document. */
 	readonly summary?: string;
 	readonly params: GenericSchema;
 	readonly result: GenericSchema;
-	readonly handler: (params: never, ctx: DurableChannelCommandContext<TEnv>) => unknown;
+	readonly handler: (
+		params: never,
+		ctx: DurableChannelCommandContext<TEnv, unknown, DurableChannelActionMap, DurableChannelNotificationMap, TPrincipal>,
+	) => unknown;
 }
 
 /** A named message the channel may push to its subscribers. */
@@ -158,11 +183,13 @@ export interface DurableChannelCommandContext<
 	TState = unknown,
 	TActions extends DurableChannelActionMap = DurableChannelActionMap,
 	TNotifications extends DurableChannelNotificationMap = DurableChannelNotificationMap,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
 > extends DurableChannelOperations<TEnv, TActions, TNotifications> {
 	readonly uri: string;
 	readonly params: Readonly<Record<string, string>>;
 	/** The connection that asked for the command, when it came from one. */
 	readonly connectionId: string | undefined;
+	readonly principal: Readonly<TPrincipal> | undefined;
 	readonly signal: AbortSignal;
 	state(): Promise<TState>;
 }
@@ -172,12 +199,17 @@ export interface DurableChannelCommandContext<
  * reducer produced, and the parsed payload. `dispatch` and `notify` are untyped here, because an
  * effect usually announces the change on another channel.
  */
-export interface DurableChannelActionEffectContext<TEnv = unknown, TState = unknown, TPayload = unknown>
-	extends DurableChannelOperations<TEnv> {
+export interface DurableChannelActionEffectContext<
+	TEnv = unknown,
+	TState = unknown,
+	TPayload = unknown,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
+> extends DurableChannelOperations<TEnv> {
 	readonly uri: string;
 	readonly params: Readonly<Record<string, string>>;
 	/** The connection whose dispatch produced the envelope, when it came from one. */
 	readonly connectionId: string | undefined;
+	readonly principal: Readonly<TPrincipal> | undefined;
 	/** The state the reducer produced. Already validated, persisted and broadcast. */
 	readonly state: TState;
 	readonly payload: TPayload;
@@ -204,6 +236,7 @@ export interface DurableChannel<
 	TActions extends DurableChannelActionMap = DurableChannelActionMap,
 	TCommands extends DurableChannelCommandMap = DurableChannelCommandMap,
 	TNotifications extends DurableChannelNotificationMap = DurableChannelNotificationMap,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
 > {
 	/** A one-line description, for the generated document. */
 	readonly summary?: string;
@@ -211,8 +244,8 @@ export interface DurableChannel<
 	readonly state: GenericSchema | undefined;
 	/** The parsed initial state, or `undefined` for a stateless channel. */
 	readonly initialState: unknown;
-	readonly actions: Readonly<Record<string, DurableChannelActionDefinition<TState, TEnv>>>;
-	readonly commands: Readonly<Record<string, DurableChannelCommandDefinition<TEnv>>>;
+	readonly actions: Readonly<Record<string, DurableChannelActionDefinition<TState, TEnv, TPrincipal>>>;
+	readonly commands: Readonly<Record<string, DurableChannelCommandDefinition<TEnv, TPrincipal>>>;
 	readonly notifications: Readonly<Record<string, DurableChannelNotificationDefinition>>;
 	/** Phantom carrier for the type parameters above. Always `undefined` at runtime. */
 	readonly types: DurableChannelTypes<TState, TActions, TCommands, TNotifications> | undefined;
@@ -226,20 +259,21 @@ export class DurableChannelActionBuilder<
 	TState = unknown,
 	TName extends string = string,
 	TPayload extends GenericSchema = GenericSchema,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
 > {
 	#name: string | undefined;
 	#payload: GenericSchema | undefined;
 	#client: boolean;
-	#reduce: DurableChannelActionDefinition<TState, TEnv>["reduce"] | undefined;
-	#effect: DurableChannelActionDefinition<TState, TEnv>["effect"];
+	#reduce: DurableChannelActionDefinition<TState, TEnv, TPrincipal>["reduce"] | undefined;
+	#effect: DurableChannelActionDefinition<TState, TEnv, TPrincipal>["effect"];
 	#summary: string | undefined;
 
 	constructor(
 		name?: string,
 		payload?: GenericSchema,
 		client = false,
-		reduce?: DurableChannelActionDefinition<TState, TEnv>["reduce"],
-		effect?: DurableChannelActionDefinition<TState, TEnv>["effect"],
+		reduce?: DurableChannelActionDefinition<TState, TEnv, TPrincipal>["reduce"],
+		effect?: DurableChannelActionDefinition<TState, TEnv, TPrincipal>["effect"],
 		summary?: string,
 	) {
 		this.#name = name;
@@ -250,7 +284,7 @@ export class DurableChannelActionBuilder<
 		this.#summary = summary;
 	}
 
-	build(): DurableChannelActionDefinition<TState, TEnv> {
+	build(): DurableChannelActionDefinition<TState, TEnv, TPrincipal> {
 		if (this.#name === undefined || this.#payload === undefined || this.#reduce === undefined) {
 			throw new InvalidDefinitionError("Cannot build an action: name, payload and reduce must be defined");
 		}
@@ -264,8 +298,8 @@ export class DurableChannelActionBuilder<
 		};
 	}
 
-	name<TNewName extends string>(name: TNewName): DurableChannelActionBuilder<TEnv, TState, TNewName, TPayload> {
-		return new DurableChannelActionBuilder<TEnv, TState, TNewName, TPayload>(
+	name<TNewName extends string>(name: TNewName): DurableChannelActionBuilder<TEnv, TState, TNewName, TPayload, TPrincipal> {
+		return new DurableChannelActionBuilder<TEnv, TState, TNewName, TPayload, TPrincipal>(
 			name,
 			this.#payload,
 			this.#client,
@@ -276,8 +310,8 @@ export class DurableChannelActionBuilder<
 	}
 
 	/** A one-line description, carried into the generated document. */
-	summary(summary: string): DurableChannelActionBuilder<TEnv, TState, TName, TPayload> {
-		return new DurableChannelActionBuilder<TEnv, TState, TName, TPayload>(
+	summary(summary: string): DurableChannelActionBuilder<TEnv, TState, TName, TPayload, TPrincipal> {
+		return new DurableChannelActionBuilder<TEnv, TState, TName, TPayload, TPrincipal>(
 			this.#name,
 			this.#payload,
 			this.#client,
@@ -287,8 +321,10 @@ export class DurableChannelActionBuilder<
 		);
 	}
 
-	payload<TNewPayload extends GenericSchema>(payload: TNewPayload): DurableChannelActionBuilder<TEnv, TState, TName, TNewPayload> {
-		return new DurableChannelActionBuilder<TEnv, TState, TName, TNewPayload>(
+	payload<TNewPayload extends GenericSchema>(
+		payload: TNewPayload,
+	): DurableChannelActionBuilder<TEnv, TState, TName, TNewPayload, TPrincipal> {
+		return new DurableChannelActionBuilder<TEnv, TState, TName, TNewPayload, TPrincipal>(
 			this.#name,
 			payload,
 			this.#client,
@@ -299,8 +335,8 @@ export class DurableChannelActionBuilder<
 	}
 
 	/** Marks the action client-dispatchable. Actions are server-only by default. */
-	client(): DurableChannelActionBuilder<TEnv, TState, TName, TPayload> {
-		return new DurableChannelActionBuilder<TEnv, TState, TName, TPayload>(
+	client(): DurableChannelActionBuilder<TEnv, TState, TName, TPayload, TPrincipal> {
+		return new DurableChannelActionBuilder<TEnv, TState, TName, TPayload, TPrincipal>(
 			this.#name,
 			this.#payload,
 			true,
@@ -316,8 +352,8 @@ export class DurableChannelActionBuilder<
 	 */
 	reduce(
 		reduce: (state: TState, payload: InferOutput<TPayload>, meta: DurableChannelActionMeta) => TState,
-	): DurableChannelActionBuilder<TEnv, TState, TName, TPayload> {
-		return new DurableChannelActionBuilder<TEnv, TState, TName, TPayload>(
+	): DurableChannelActionBuilder<TEnv, TState, TName, TPayload, TPrincipal> {
+		return new DurableChannelActionBuilder<TEnv, TState, TName, TPayload, TPrincipal>(
 			this.#name,
 			this.#payload,
 			this.#client,
@@ -332,9 +368,9 @@ export class DurableChannelActionBuilder<
 	 * accepted. It may dispatch, notify and touch other instances; a client ignores it entirely.
 	 */
 	effect(
-		effect: (ctx: DurableChannelActionEffectContext<TEnv, TState, InferOutput<TPayload>>) => void | Promise<void>,
-	): DurableChannelActionBuilder<TEnv, TState, TName, TPayload> {
-		return new DurableChannelActionBuilder<TEnv, TState, TName, TPayload>(
+		effect: (ctx: DurableChannelActionEffectContext<TEnv, TState, InferOutput<TPayload>, TPrincipal>) => void | Promise<void>,
+	): DurableChannelActionBuilder<TEnv, TState, TName, TPayload, TPrincipal> {
+		return new DurableChannelActionBuilder<TEnv, TState, TName, TPayload, TPrincipal>(
 			this.#name,
 			this.#payload,
 			this.#client,
@@ -354,18 +390,19 @@ export class DurableChannelCommandBuilder<
 	TName extends string = string,
 	TParams extends GenericSchema = GenericSchema,
 	TResult extends GenericSchema = GenericSchema,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
 > {
 	#name: string | undefined;
 	#params: GenericSchema | undefined;
 	#result: GenericSchema | undefined;
-	#handler: DurableChannelCommandDefinition<TEnv>["handler"] | undefined;
+	#handler: DurableChannelCommandDefinition<TEnv, TPrincipal>["handler"] | undefined;
 	#summary: string | undefined;
 
 	constructor(
 		name?: string,
 		params?: GenericSchema,
 		result?: GenericSchema,
-		handler?: DurableChannelCommandDefinition<TEnv>["handler"],
+		handler?: DurableChannelCommandDefinition<TEnv, TPrincipal>["handler"],
 		summary?: string,
 	) {
 		this.#name = name;
@@ -375,7 +412,7 @@ export class DurableChannelCommandBuilder<
 		this.#summary = summary;
 	}
 
-	build(): DurableChannelCommandDefinition<TEnv> {
+	build(): DurableChannelCommandDefinition<TEnv, TPrincipal> {
 		if (this.#name === undefined || this.#params === undefined || this.#result === undefined || this.#handler === undefined) {
 			throw new InvalidDefinitionError("Cannot build a command: name, params, result and handler must be defined");
 		}
@@ -390,24 +427,24 @@ export class DurableChannelCommandBuilder<
 
 	name<TNewName extends string>(
 		name: TNewName,
-	): DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications, TNewName, TParams, TResult> {
+	): DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications, TNewName, TParams, TResult, TPrincipal> {
 		return new DurableChannelCommandBuilder(name, this.#params, this.#result, this.#handler, this.#summary);
 	}
 
 	/** A one-line description, carried into the generated document. */
-	summary(summary: string): DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications, TName, TParams, TResult> {
+	summary(summary: string): DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications, TName, TParams, TResult, TPrincipal> {
 		return new DurableChannelCommandBuilder(this.#name, this.#params, this.#result, this.#handler, summary);
 	}
 
 	params<TNewParams extends GenericSchema>(
 		params: TNewParams,
-	): DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications, TName, TNewParams, TResult> {
+	): DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications, TName, TNewParams, TResult, TPrincipal> {
 		return new DurableChannelCommandBuilder(this.#name, params, this.#result, this.#handler, this.#summary);
 	}
 
 	result<TNewResult extends GenericSchema>(
 		result: TNewResult,
-	): DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications, TName, TParams, TNewResult> {
+	): DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications, TName, TParams, TNewResult, TPrincipal> {
 		return new DurableChannelCommandBuilder(this.#name, this.#params, result, this.#handler, this.#summary);
 	}
 
@@ -418,9 +455,9 @@ export class DurableChannelCommandBuilder<
 	handler(
 		handler: (
 			params: InferOutput<TParams>,
-			ctx: DurableChannelCommandContext<TEnv, TState, TActions, TNotifications>,
+			ctx: DurableChannelCommandContext<TEnv, TState, TActions, TNotifications, TPrincipal>,
 		) => InferInput<TResult> | Promise<InferInput<TResult>>,
-	): DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications, TName, TParams, TResult> {
+	): DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications, TName, TParams, TResult, TPrincipal> {
 		return new DurableChannelCommandBuilder(this.#name, this.#params, this.#result, handler as never, this.#summary);
 	}
 }
@@ -463,8 +500,17 @@ export class DurableChannelNotificationBuilder<
 
 // ─── Channel builders ────────────────────────────────────────────────────────
 
-type AnyActionBuilder = DurableChannelActionBuilder<never, never, string, GenericSchema>;
-type AnyCommandBuilder = DurableChannelCommandBuilder<never, never, DurableChannelActionMap, DurableChannelNotificationMap>;
+type AnyActionBuilder = DurableChannelActionBuilder<never, never, string, GenericSchema, never>;
+type AnyCommandBuilder = DurableChannelCommandBuilder<
+	never,
+	never,
+	DurableChannelActionMap,
+	DurableChannelNotificationMap,
+	string,
+	GenericSchema,
+	GenericSchema,
+	never
+>;
 type AnyNotificationBuilder = DurableChannelNotificationBuilder<string, GenericSchema>;
 
 function collect<TDefinition extends { name: string }>(
@@ -492,6 +538,7 @@ export class DurableChannelStatelessBuilder<
 	TEnv = unknown,
 	TCommands extends DurableChannelCommandMap = Record<never, never>,
 	TNotifications extends DurableChannelNotificationMap = Record<never, never>,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
 > {
 	#commands: readonly AnyCommandBuilder[];
 	#notifications: readonly AnyNotificationBuilder[];
@@ -503,40 +550,58 @@ export class DurableChannelStatelessBuilder<
 		this.#summary = summary;
 	}
 
-	build(): DurableChannel<TEnv, undefined, Record<never, never>, TCommands, TNotifications> {
+	build(): DurableChannel<TEnv, undefined, Record<never, never>, TCommands, TNotifications, TPrincipal> {
 		return Object.freeze({
 			...(this.#summary !== undefined ? { summary: this.#summary } : {}),
 			state: undefined,
 			initialState: undefined,
 			actions: Object.freeze({}),
-			commands: Object.freeze(collect<DurableChannelCommandDefinition<TEnv>>(this.#commands as never, "command")),
+			commands: Object.freeze(collect<DurableChannelCommandDefinition<TEnv, TPrincipal>>(this.#commands as never, "command")),
 			notifications: Object.freeze(collect<DurableChannelNotificationDefinition>(this.#notifications, "notification")),
 			types: undefined,
 		});
 	}
 
-	env<TNewEnv>(): DurableChannelStatelessBuilder<TNewEnv, TCommands, TNotifications> {
-		return new DurableChannelStatelessBuilder<TNewEnv, TCommands, TNotifications>(this.#commands, this.#notifications, this.#summary);
+	env<TNewEnv>(): DurableChannelStatelessBuilder<TNewEnv, TCommands, TNotifications, TPrincipal> {
+		return new DurableChannelStatelessBuilder<TNewEnv, TCommands, TNotifications, TPrincipal>(
+			this.#commands,
+			this.#notifications,
+			this.#summary,
+		);
+	}
+
+	/** Declares the trusted caller type; the host validates and supplies its value. */
+	principal<TNewPrincipal extends TPrincipal>(): DurableChannelStatelessBuilder<TEnv, TCommands, TNotifications, TNewPrincipal> {
+		return new DurableChannelStatelessBuilder(this.#commands, this.#notifications, this.#summary);
 	}
 
 	/** A one-line description of the channel, carried into the generated document. */
-	summary(summary: string): DurableChannelStatelessBuilder<TEnv, TCommands, TNotifications> {
-		return new DurableChannelStatelessBuilder<TEnv, TCommands, TNotifications>(this.#commands, this.#notifications, summary);
+	summary(summary: string): DurableChannelStatelessBuilder<TEnv, TCommands, TNotifications, TPrincipal> {
+		return new DurableChannelStatelessBuilder<TEnv, TCommands, TNotifications, TPrincipal>(this.#commands, this.#notifications, summary);
 	}
 
 	/** Declares the state and its initial value, which is what unlocks `.action()`. */
 	state<TSchema extends GenericSchema>(
 		schema: TSchema,
 		initialState: InferInput<TSchema>,
-	): DurableChannelBuilder<TEnv, InferOutput<TSchema>, Record<never, never>, TCommands, TNotifications> {
+	): DurableChannelBuilder<TEnv, InferOutput<TSchema>, Record<never, never>, TCommands, TNotifications, TPrincipal> {
 		return new DurableChannelBuilder(schema, initialState, [], this.#commands, this.#notifications, this.#summary);
 	}
 
 	command<TName extends string, TParams extends GenericSchema, TResult extends GenericSchema>(
 		builder: (
-			builder: DurableChannelCommandBuilder<TEnv, undefined, Record<never, never>, TNotifications>,
-		) => DurableChannelCommandBuilder<TEnv, undefined, Record<never, never>, TNotifications, TName, TParams, TResult>,
-	): DurableChannelStatelessBuilder<TEnv, TCommands & { [K in TName]: { params: TParams; result: TResult } }, TNotifications> {
+			builder: DurableChannelCommandBuilder<
+				TEnv,
+				undefined,
+				Record<never, never>,
+				TNotifications,
+				string,
+				GenericSchema,
+				GenericSchema,
+				TPrincipal
+			>,
+		) => DurableChannelCommandBuilder<TEnv, undefined, Record<never, never>, TNotifications, TName, TParams, TResult, TPrincipal>,
+	): DurableChannelStatelessBuilder<TEnv, TCommands & { [K in TName]: { params: TParams; result: TResult } }, TNotifications, TPrincipal> {
 		return new DurableChannelStatelessBuilder(
 			[...this.#commands, builder(new DurableChannelCommandBuilder()) as never],
 			this.#notifications,
@@ -546,7 +611,7 @@ export class DurableChannelStatelessBuilder<
 
 	notification<TName extends string, TPayload extends GenericSchema>(
 		builder: (builder: DurableChannelNotificationBuilder) => DurableChannelNotificationBuilder<TName, TPayload>,
-	): DurableChannelStatelessBuilder<TEnv, TCommands, TNotifications & { [K in TName]: TPayload }> {
+	): DurableChannelStatelessBuilder<TEnv, TCommands, TNotifications & { [K in TName]: TPayload }, TPrincipal> {
 		return new DurableChannelStatelessBuilder(
 			this.#commands,
 			[...this.#notifications, builder(new DurableChannelNotificationBuilder())],
@@ -562,6 +627,7 @@ export class DurableChannelBuilder<
 	TActions extends DurableChannelActionMap = Record<never, never>,
 	TCommands extends DurableChannelCommandMap = Record<never, never>,
 	TNotifications extends DurableChannelNotificationMap = Record<never, never>,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
 > {
 	#state: GenericSchema;
 	#initialState: unknown;
@@ -587,7 +653,7 @@ export class DurableChannelBuilder<
 	}
 
 	/** Parses the initial state through the state schema, so defaults are applied once and for all. */
-	build(): DurableChannel<TEnv, TState, TActions, TCommands, TNotifications> {
+	build(): DurableChannel<TEnv, TState, TActions, TCommands, TNotifications, TPrincipal> {
 		const parsed = safeParse(this.#state, this.#initialState);
 		if (!parsed.success) {
 			throw new InvalidStateError("<initial>");
@@ -596,29 +662,36 @@ export class DurableChannelBuilder<
 			...(this.#summary !== undefined ? { summary: this.#summary } : {}),
 			state: this.#state,
 			initialState: parsed.output,
-			actions: Object.freeze(collect<DurableChannelActionDefinition<TState, TEnv>>(this.#actions as never, "action")),
-			commands: Object.freeze(collect<DurableChannelCommandDefinition<TEnv>>(this.#commands as never, "command")),
+			actions: Object.freeze(collect<DurableChannelActionDefinition<TState, TEnv, TPrincipal>>(this.#actions as never, "action")),
+			commands: Object.freeze(collect<DurableChannelCommandDefinition<TEnv, TPrincipal>>(this.#commands as never, "command")),
 			notifications: Object.freeze(collect<DurableChannelNotificationDefinition>(this.#notifications, "notification")),
 			types: undefined,
 		});
 	}
 
-	env<TNewEnv>(): DurableChannelBuilder<TNewEnv, TState, TActions, TCommands, TNotifications> {
+	env<TNewEnv>(): DurableChannelBuilder<TNewEnv, TState, TActions, TCommands, TNotifications, TPrincipal> {
+		return new DurableChannelBuilder(this.#state, this.#initialState, this.#actions, this.#commands, this.#notifications, this.#summary);
+	}
+
+	/** Declares the trusted caller type; reducers receive only its recorded ID. */
+	principal<TNewPrincipal extends TPrincipal>(): DurableChannelBuilder<TEnv, TState, TActions, TCommands, TNotifications, TNewPrincipal> {
 		return new DurableChannelBuilder(this.#state, this.#initialState, this.#actions, this.#commands, this.#notifications, this.#summary);
 	}
 
 	/** A one-line description of the channel, carried into the generated document. */
-	summary(summary: string): DurableChannelBuilder<TEnv, TState, TActions, TCommands, TNotifications> {
+	summary(summary: string): DurableChannelBuilder<TEnv, TState, TActions, TCommands, TNotifications, TPrincipal> {
 		return new DurableChannelBuilder(this.#state, this.#initialState, this.#actions, this.#commands, this.#notifications, summary);
 	}
 
 	action<TName extends string, TPayload extends GenericSchema>(
-		builder: (builder: DurableChannelActionBuilder<TEnv, TState>) => DurableChannelActionBuilder<TEnv, TState, TName, TPayload>,
-	): DurableChannelBuilder<TEnv, TState, TActions & { [K in TName]: TPayload }, TCommands, TNotifications> {
+		builder: (
+			builder: DurableChannelActionBuilder<TEnv, TState, string, GenericSchema, TPrincipal>,
+		) => DurableChannelActionBuilder<TEnv, TState, TName, TPayload, TPrincipal>,
+	): DurableChannelBuilder<TEnv, TState, TActions & { [K in TName]: TPayload }, TCommands, TNotifications, TPrincipal> {
 		return new DurableChannelBuilder(
 			this.#state,
 			this.#initialState,
-			[...this.#actions, builder(new DurableChannelActionBuilder<TEnv, TState>()) as never],
+			[...this.#actions, builder(new DurableChannelActionBuilder<TEnv, TState, string, GenericSchema, TPrincipal>()) as never],
 			this.#commands,
 			this.#notifications,
 			this.#summary,
@@ -627,9 +700,16 @@ export class DurableChannelBuilder<
 
 	command<TName extends string, TParams extends GenericSchema, TResult extends GenericSchema>(
 		builder: (
-			builder: DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications>,
-		) => DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications, TName, TParams, TResult>,
-	): DurableChannelBuilder<TEnv, TState, TActions, TCommands & { [K in TName]: { params: TParams; result: TResult } }, TNotifications> {
+			builder: DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications, string, GenericSchema, GenericSchema, TPrincipal>,
+		) => DurableChannelCommandBuilder<TEnv, TState, TActions, TNotifications, TName, TParams, TResult, TPrincipal>,
+	): DurableChannelBuilder<
+		TEnv,
+		TState,
+		TActions,
+		TCommands & { [K in TName]: { params: TParams; result: TResult } },
+		TNotifications,
+		TPrincipal
+	> {
 		return new DurableChannelBuilder(
 			this.#state,
 			this.#initialState,
@@ -642,7 +722,7 @@ export class DurableChannelBuilder<
 
 	notification<TName extends string, TPayload extends GenericSchema>(
 		builder: (builder: DurableChannelNotificationBuilder) => DurableChannelNotificationBuilder<TName, TPayload>,
-	): DurableChannelBuilder<TEnv, TState, TActions, TCommands, TNotifications & { [K in TName]: TPayload }> {
+	): DurableChannelBuilder<TEnv, TState, TActions, TCommands, TNotifications & { [K in TName]: TPayload }, TPrincipal> {
 		return new DurableChannelBuilder(
 			this.#state,
 			this.#initialState,

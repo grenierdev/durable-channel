@@ -95,6 +95,27 @@ const room = durableChannel()
 			.client()
 			.reduce((state, payload) => ({ messages: [...state.messages, payload] }))
 	)
+	.action((a) =>
+		a.name("log/messagePosted")
+			.payload(v.object({ author: v.string(), text: v.string(), clientSeq: v.number() }))
+			.client()
+			.reduce((state, payload, meta) => {
+				if (payload.author !== meta.origin?.clientId || payload.clientSeq !== meta.origin?.clientSeq) {
+					throw new RejectAction("origin must match the author and sequence");
+				}
+				return { messages: [...state.messages, { author: payload.author, text: payload.text }] };
+			})
+	)
+	.action((a) =>
+		a.name("room/systemSaid")
+			.payload(v.object({ text: v.string() }))
+			.reduce((state, payload, meta) => {
+				if (meta.origin !== undefined) {
+					throw new RejectAction("system messages must have no origin");
+				}
+				return { messages: [...state.messages, { author: "system", text: payload.text }] };
+			})
+	)
 	.action((a) => a.name("room/cleared").payload(v.object({})).reduce(() => ({ messages: [] })))
 	.command((c) =>
 		c.name("clear")
@@ -165,6 +186,7 @@ function collect(subscription: DurableChannelSubscription) {
 
 /** One client-side transport with `rpc` answering on the other half, plus the knobs a drop test needs. */
 interface ServedLink {
+	readonly connection: DurableChannelConnection | undefined;
 	readonly transport: InMemoryTransport;
 	readonly loop: Promise<void>;
 	/** Nothing goes back any more — neither responses nor broadcasts. The hub still commits. */
@@ -202,12 +224,19 @@ function boot(options?: { replayLimit?: number }) {
 			}
 		};
 		const link: DurableChannelLink = {
+			get connection() {
+				return binding?.connection;
+			},
+			unbind() {
+				if (binding) hub.disconnect(binding.connection);
+				binding = undefined;
+			},
 			get clientId(): string | undefined {
 				return binding?.clientId;
 			},
 			bind(clientId: string): void {
 				if (binding !== undefined) {
-					hub.disconnect(binding.clientId, binding.connection);
+					hub.disconnect(binding.connection);
 				}
 				const connection = hub.connect({
 					id: clientId,
@@ -232,11 +261,14 @@ function boot(options?: { replayLimit?: number }) {
 				}
 			}
 			if (binding !== undefined) {
-				hub.disconnect(binding.clientId, binding.connection);
+				hub.disconnect(binding.connection);
 				binding = undefined;
 			}
 		})();
 		const served: ServedLink = {
+			get connection() {
+				return binding?.connection;
+			},
 			transport: clientHalf,
 			loop,
 			mute(): void {
@@ -289,6 +321,67 @@ function boot(options?: { replayLimit?: number }) {
 }
 
 describe("DurableChannelClient", () => {
+	it("authorizes optimistic actions by origin and mirrors the sender's origin on other clients", async () => {
+		const host = boot();
+		try {
+			await host.newRoom("lobby");
+			const { client } = await host.open("alice", ["room:/lobby"]);
+			const bob = await host.open("bob", ["room:/lobby"]);
+			const accepted = client.dispatch("room:/lobby", "log/messagePosted", { author: "alice", text: "hello", clientSeq: 1 });
+			const expected = { messages: [{ author: "alice", text: "hello" }] };
+			assertEquals(client.state("room:/lobby"), expected);
+			assertEquals(client.confirmed("room:/lobby"), { messages: [] });
+			assertEquals((await withTimeout(accepted.settled, "the authorized echo")).status, "confirmed");
+			await until("bob to apply alice's origin", () => bob.client.confirmed("room:/lobby").messages.length === 1);
+			assertEquals(bob.client.state("room:/lobby"), expected);
+			assertEquals(client.confirmed("room:/lobby"), expected);
+			const rejected = client.dispatch("room:/lobby", "log/messagePosted", { author: "bob", text: "forged", clientSeq: 2 });
+			assertEquals(client.state("room:/lobby"), expected);
+			const outcome = await withTimeout(rejected.settled, "the rejected echo");
+			assert(outcome.status === "rejected");
+			assertEquals(outcome.envelope.origin, { clientId: "alice", clientSeq: 2 });
+			assertEquals(await host.hub.get("room:/lobby"), expected);
+			assertEquals(client.pending("room:/lobby"), []);
+			await host.hub.dispatch("room:/lobby", "room/systemSaid", { text: "notice" });
+			await until(
+				"both clients to apply the server origin",
+				() => client.confirmed("room:/lobby").messages.length === 2 && bob.client.confirmed("room:/lobby").messages.length === 2,
+			);
+			assertEquals(client.state("room:/lobby"), await host.hub.get("room:/lobby"));
+		} finally {
+			await host.stop();
+		}
+	});
+
+	it("preserves origin through pending rebases and reconnect replay", async () => {
+		const host = boot();
+		try {
+			await host.newRoom("lobby");
+			const { client, link } = await host.open("alice", ["room:/lobby"]);
+			link.mute();
+			const first = client.dispatch("room:/lobby", "log/messagePosted", { author: "alice", text: "first", clientSeq: 1 });
+			const second = client.dispatch("room:/lobby", "log/messagePosted", { author: "alice", text: "second", clientSeq: 2 });
+			const expected = { messages: [{ author: "alice", text: "first" }, { author: "alice", text: "second" }] };
+			assertEquals(client.state("room:/lobby"), expected);
+			await until("both actions to commit", () => host.hub.serverSeq === 2);
+			link.close();
+			await until("the transport to close", () => client.connectionState.status === "closed");
+			const resumed = await withTimeout(client.reconnect(host.serve().transport), "the origin replay");
+			assert(resumed.type === "replay");
+			assertEquals(resumed.actions.map((envelope) => envelope.origin), [
+				{ clientId: "alice", clientSeq: 1 },
+				{ clientId: "alice", clientSeq: 2 },
+			]);
+			assertEquals((await withTimeout(first.settled, "first replay")).status, "confirmed");
+			assertEquals((await withTimeout(second.settled, "second replay")).status, "confirmed");
+			assertEquals(client.confirmed("room:/lobby"), expected);
+			assertEquals(client.state("room:/lobby"), await host.hub.get("room:/lobby"));
+			assertEquals(client.pending("room:/lobby"), []);
+		} finally {
+			await host.stop();
+		}
+	});
+
 	it("takes a snapshot on hello and types the state from the route the URI matches", async () => {
 		const host = boot();
 		try {
@@ -419,8 +512,9 @@ describe("DurableChannelClient", () => {
 		const host = boot();
 		try {
 			await host.newGame("1");
-			const { client } = await host.open("alice", ["game:/1"]);
-			await host.hub.dispatchFrom("alice", "game:/1", "game/moved", { cell: 0, player: "X" }, 9);
+			const { client, link } = await host.open("alice", ["game:/1"]);
+			assert(link.connection);
+			await host.hub.dispatchFrom(link.connection, "game:/1", "game/moved", { cell: 0, player: "X" }, 9);
 			await until("the client to see the move", () => client.confirmed("game:/1").board[0] === "X");
 			const handle = client.dispatch("game:/1", "game/moved", { cell: 1, player: "O" });
 			assertEquals(client.state("game:/1").board[1], "O");

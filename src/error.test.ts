@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import { assert, assertEquals, assertInstanceOf } from "@std/assert";
 import {
+	AuthenticationRequiredError,
 	ChannelAlreadyExistsError,
 	ChannelNotFoundError,
 	ConnectionNotFoundError,
@@ -10,6 +11,7 @@ import {
 	InvalidResultError,
 	InvalidStateError,
 	NotClientDispatchableError,
+	PermissionDeniedError,
 	RejectAction,
 	RouteNotFoundError,
 	StatelessChannelError,
@@ -20,6 +22,8 @@ import {
 
 describe("error", () => {
 	const instances: [DurableChannelError, string][] = [
+		[new AuthenticationRequiredError(), "AUTHENTICATION_REQUIRED"],
+		[new PermissionDeniedError(), "PERMISSION_DENIED"],
 		[new RouteNotFoundError("nope://"), "ROUTE_NOT_FOUND"],
 		[new ChannelNotFoundError("doc:/1"), "CHANNEL_NOT_FOUND"],
 		[new ChannelAlreadyExistsError("doc:/1"), "CHANNEL_ALREADY_EXISTS"],
