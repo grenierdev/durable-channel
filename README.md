@@ -130,7 +130,8 @@ envelope's origin when applying broadcasts or replay. Reducers can therefore enf
 ```
 
 The host supplies the authenticated principal independently of the tab’s `clientId`. Anonymous dispatches omit `principalId`, so this
-ownership check rejects them as well as server dispatches, which have no origin. Role-based authorization stays in commands.
+ownership check rejects them as well as server dispatches, which have no origin. Role-based authorization belongs in the channel's
+server-side `.client(handler)` policy or in command handlers.
 
 A command handler receives `(params, ctx)`:
 
@@ -226,12 +227,55 @@ sign-in or sign-out) throws `IdentityChangedError`, closes the client, clears it
 client when changing accounts. Refreshing the same principal ID may supply new server-side fields without changing the client's identity.
 
 The host owns credential verification, expiry and revocation; call `session.close()` on every affected socket. Already-admitted commands and
-effects are not rolled back, and background work remains instance-owned. Authentication does not enforce channel permissions: applications
-must enforce access to initial/subsequent subscriptions, replay/snapshots, commands, dispatch and continued delivery, using their adapter
-and application handlers. The standard adapter permits access to public routes for authenticated and anonymous clients.
+effects are not rolled back, and background work remains instance-owned.
 
 Custom links expose their bound `connection` and implement `unbind()` for failed-handshake cleanup. Anonymous callers need no principal or
 authentication options.
+
+## Channel authorization
+
+Use `.client(handler)` on a channel to authorize client operations on the server. The handler returns a bit field; combine
+`DurableChannelPermission.Subscribe`, `.Dispatch` and `.Execute` with `|`, or return `.None` or `.All`:
+
+```ts
+import { durableChannel, DurableChannelPermission as Permission } from "durable-channel";
+import * as v from "valibot";
+
+type Principal = { id: string; role: "reader" | "editor" | "admin" };
+
+const counter = durableChannel()
+	.principal<Principal>()
+	.state(v.object({ count: v.number() }), { count: 0 })
+	.client((ctx, request) => {
+		if (ctx.principal?.role === "admin") return Permission.All;
+		if (request.type === "command" && request.name === "reset") return Permission.None;
+		if (ctx.principal?.role === "editor") {
+			return Permission.Subscribe | Permission.Dispatch | Permission.Execute;
+		}
+		return Permission.Subscribe; // Readers and anonymous clients may observe.
+	})
+	.action((a) =>
+		a.name("increment").payload(v.object({ by: v.number() })).client()
+			.reduce((state, payload) => ({ count: state.count + payload.by }))
+	)
+	.build();
+```
+
+The context has `env`, `uri`, route `params`, `connectionId`, optional typed `principal`, and `state()`. Declare `.state()` before
+`.client(handler)` for typed state access. The request is `{ type: "subscribe" }`, `{ type: "action", name, payload }`, or
+`{ type: "command", name, params }`. Payloads and command params have passed their schemas; the request's data fields are typed as
+`unknown`. Handlers may be asynchronous and should only read state and permissions. Action authorization runs inside the commit lock, so a
+state-dependent check sees the state the reducer will receive; keep these checks short and do not dispatch back into the hub from them.
+
+`Subscribe` gates initial subscriptions, later subscriptions, and reconnect replay or snapshots. A denied subscription or command throws
+`PermissionDeniedError`; denied reconnect channels appear in `missing`. A denied action commits a rejected envelope without changing state
+or running its effect. Clients never run the policy: they reduce optimistically, then reconcile against the accepted or rejected envelope. A
+policy that throws or returns an invalid bit field denies the operation.
+
+Without a channel policy, all three permissions are allowed. Individual actions still need their own `.client()` to accept client
+dispatches, and internal routes remain inaccessible to clients. Server `dispatch`, server `exec`, and nested calls from accepted handlers
+are trusted and bypass the policy. Subscription permission admits continued delivery until unsubscribe or disconnect; close affected
+sessions when revoking access. A denied re-subscription removes an existing subscription.
 
 ## Effects
 
@@ -679,18 +723,18 @@ The hub pushes two notifications back: `action`, whose params are an envelope wi
 `{ channel, name, payload }`. `toRpcNotification(message)` and `fromRpcNotification(method, params)` are that translation, in both
 directions, and `fromRpcNotification` answers `undefined` for anything this protocol does not define.
 
-| `DurableChannelRpcErrorCodes` | Code     | Raised for                                                          |
-| ----------------------------- | -------- | ------------------------------------------------------------------- |
-| `ChannelNotFound`             | `-32001` | `ROUTE_NOT_FOUND`, `CHANNEL_NOT_FOUND` — an internal route included |
-| `ChannelAlreadyExists`        | `-32002` | `CHANNEL_ALREADY_EXISTS`                                            |
-| `NotInitialized`              | `-32003` | the link is bound to no client id yet                               |
-| `ConnectionNotFound`          | `-32004` | `CONNECTION_NOT_FOUND`                                              |
-| `ActionRejected`              | `-32005` | a command threw `RejectAction`; `data` carries `{ reason }`         |
-| `AuthenticationRequired`      | `-32007` | an application handler requires authentication                      |
-| `PermissionDenied`            | `-32009` | an application handler or connection binding denies access          |
-| `MethodNotFound`              | `-32601` | an unknown method, and `UNKNOWN_COMMAND`                            |
-| `InvalidParams`               | `-32602` | params or a payload that fails its schema                           |
-| `InternalError`               | `-32603` | everything else, with no message from the inside                    |
+| `DurableChannelRpcErrorCodes` | Code     | Raised for                                                                |
+| ----------------------------- | -------- | ------------------------------------------------------------------------- |
+| `ChannelNotFound`             | `-32001` | `ROUTE_NOT_FOUND`, `CHANNEL_NOT_FOUND` — an internal route included       |
+| `ChannelAlreadyExists`        | `-32002` | `CHANNEL_ALREADY_EXISTS`                                                  |
+| `NotInitialized`              | `-32003` | the link is bound to no client id yet                                     |
+| `ConnectionNotFound`          | `-32004` | `CONNECTION_NOT_FOUND`                                                    |
+| `ActionRejected`              | `-32005` | a command threw `RejectAction`; `data` carries `{ reason }`               |
+| `AuthenticationRequired`      | `-32007` | an application handler requires authentication                            |
+| `PermissionDenied`            | `-32009` | a channel policy, application handler or connection binding denies access |
+| `MethodNotFound`              | `-32601` | an unknown method, and `UNKNOWN_COMMAND`                                  |
+| `InvalidParams`               | `-32602` | params or a payload that fails its schema                                 |
+| `InternalError`               | `-32603` | everything else, with no message from the inside                          |
 
 A `DurableChannelError` keeps its stable code in the message as `` `${code}: ${message}` ``, so a peer can read what happened without
 matching on prose. `toJsonRpcError(error)` is the mapping, exported for a host that answers its own methods alongside these.
@@ -788,25 +832,25 @@ the runtime inside `open` alone, so importing `storage.ts` elsewhere never touch
 Every failure is a `DurableChannelError` carrying a stable string `code`, so a transport can map codes onto its own error table without
 matching on messages.
 
-| Class                         | `code`                    | Raised when                                                                         |
-| ----------------------------- | ------------------------- | ----------------------------------------------------------------------------------- |
-| `RouteNotFoundError`          | `ROUTE_NOT_FOUND`         | no template matches the URI                                                         |
-| `ChannelNotFoundError`        | `CHANNEL_NOT_FOUND`       | the route matches but no instance exists                                            |
-| `ChannelAlreadyExistsError`   | `CHANNEL_ALREADY_EXISTS`  | `create()` on a URI that already holds an instance                                  |
-| `UnknownActionError`          | `UNKNOWN_ACTION`          | no action of that name on the channel                                               |
-| `UnknownCommandError`         | `UNKNOWN_COMMAND`         | no command of that name                                                             |
-| `UnknownNotificationError`    | `UNKNOWN_NOTIFICATION`    | no notification of that name                                                        |
-| `InvalidPayloadError`         | `INVALID_PAYLOAD`         | an action payload, command params or notification payload fails its schema          |
-| `InvalidStateError`           | `INVALID_STATE`           | an initial state, a `create()` state or a reducer's output fails the state schema   |
-| `InvalidResultError`          | `INVALID_RESULT`          | a command handler's return value fails its result schema                            |
-| `NotClientDispatchableError`  | `NOT_CLIENT_DISPATCHABLE` | a connection dispatched a server-only action                                        |
-| `ConnectionNotFoundError`     | `CONNECTION_NOT_FOUND`    | no connection under that id                                                         |
-| `AuthenticationRequiredError` | `AUTHENTICATION_REQUIRED` | application handler requires a principal                                            |
-| `PermissionDeniedError`       | `PERMISSION_DENIED`       | application denies access, or connection binding conflicts with an active principal |
-| `InvalidDefinitionError`      | `INVALID_DEFINITION`      | an incomplete member, a duplicate name, a template missing a parameter value        |
-| `StatelessChannelError`       | `STATELESS_CHANNEL`       | a state operation on a channel declared without `.state()`                          |
-| `NotInitializedError`         | `NOT_INITIALIZED`         | a wire call that needs a client id arrived on a link nothing has bound              |
-| `RejectAction`                | —                         | a reducer refused the action; **not** a `DurableChannelError`                       |
+| Class                         | `code`                    | Raised when                                                                                           |
+| ----------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `RouteNotFoundError`          | `ROUTE_NOT_FOUND`         | no template matches the URI                                                                           |
+| `ChannelNotFoundError`        | `CHANNEL_NOT_FOUND`       | the route matches but no instance exists                                                              |
+| `ChannelAlreadyExistsError`   | `CHANNEL_ALREADY_EXISTS`  | `create()` on a URI that already holds an instance                                                    |
+| `UnknownActionError`          | `UNKNOWN_ACTION`          | no action of that name on the channel                                                                 |
+| `UnknownCommandError`         | `UNKNOWN_COMMAND`         | no command of that name                                                                               |
+| `UnknownNotificationError`    | `UNKNOWN_NOTIFICATION`    | no notification of that name                                                                          |
+| `InvalidPayloadError`         | `INVALID_PAYLOAD`         | an action payload, command params or notification payload fails its schema                            |
+| `InvalidStateError`           | `INVALID_STATE`           | an initial state, a `create()` state or a reducer's output fails the state schema                     |
+| `InvalidResultError`          | `INVALID_RESULT`          | a command handler's return value fails its result schema                                              |
+| `NotClientDispatchableError`  | `NOT_CLIENT_DISPATCHABLE` | a connection dispatched a server-only action                                                          |
+| `ConnectionNotFoundError`     | `CONNECTION_NOT_FOUND`    | no connection under that id                                                                           |
+| `AuthenticationRequiredError` | `AUTHENTICATION_REQUIRED` | application handler requires a principal                                                              |
+| `PermissionDeniedError`       | `PERMISSION_DENIED`       | channel policy or application denies access, or connection binding conflicts with an active principal |
+| `InvalidDefinitionError`      | `INVALID_DEFINITION`      | an incomplete member, a duplicate name, a template missing a parameter value                          |
+| `StatelessChannelError`       | `STATELESS_CHANNEL`       | a state operation on a channel declared without `.state()`                                            |
+| `NotInitializedError`         | `NOT_INITIALIZED`         | a wire call that needs a client id arrived on a link nothing has bound                                |
+| `RejectAction`                | —                         | a reducer refused the action; **not** a `DurableChannelError`                                         |
 
 `DurableChannelError` is also thrown directly, with the code `STORAGE_UNAVAILABLE`, when `DenoKvStorage.open` runs on a runtime that has no
 `Deno.openKv`. An action effect's failure is not translated at all: whatever it throws reaches whoever dispatched the action.

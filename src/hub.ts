@@ -17,11 +17,13 @@
  */
 import { type GenericSchema, type InferInput, type InferOutput, safeParse } from "valibot";
 import { describeRoutes, type DurableChannelDocument, type DurableChannelDocumentOptions } from "./document.ts";
+import { DurableChannelPermission } from "./channel.ts";
 import type {
 	DurableChannel,
 	DurableChannelActionDefinition,
 	DurableChannelActionMap,
 	DurableChannelActionOrigin,
+	DurableChannelAuthorizationRequest,
 	DurableChannelCommandContext,
 	DurableChannelCommandMap,
 	DurableChannelEnvelope,
@@ -307,6 +309,13 @@ export class DurableChannelHub<
 		await this.ready();
 		const link = this.#link(connection);
 		const match = this.#reachable(uri);
+		try {
+			await this.#authorize(connection, uri, { type: "subscribe" }, DurableChannelPermission.Subscribe);
+		} catch (error) {
+			if (error instanceof PermissionDeniedError) link.subscriptions.delete(uri);
+			throw error;
+		}
+		this.#link(connection);
 		if (match.route.definition.state === undefined) {
 			link.subscriptions.add(uri);
 			return undefined;
@@ -325,7 +334,7 @@ export class DurableChannelHub<
 	/**
 	 * Restores a link's subscriptions and hands back what it missed. Replay while the ring still covers
 	 * everything after `lastSeenServerSeq`, fresh snapshots otherwise. URIs the hub cannot resume come
-	 * back in `missing` — an unknown route, an internal route and a destroyed instance alike; a
+	 * back in `missing` — an unknown route, an internal route, a denied subscription and a destroyed instance alike; a
 	 * stateless URI is re-subscribed and listed in neither.
 	 */
 	async reconnect(
@@ -341,6 +350,14 @@ export class DurableChannelHub<
 		for (const uri of uris) {
 			const match = matchRoute(this.#routes, uri);
 			if (match === undefined || match.route.internal) {
+				missing.push(uri);
+				continue;
+			}
+			try {
+				await this.#authorize(connection, uri, { type: "subscribe" }, DurableChannelPermission.Subscribe);
+				this.#link(connection);
+			} catch (error) {
+				if (!(error instanceof PermissionDeniedError)) throw error;
 				missing.push(uri);
 				continue;
 			}
@@ -403,7 +420,8 @@ export class DurableChannelHub<
 	 * Commits an action a connection dispatched. Returns `undefined` when `clientSeq` is not greater
 	 * than the highest this link has accepted, consuming no sequence. With `lenient`, an unknown action,
 	 * a server-only action or a payload failing its schema becomes a rejected envelope instead of a
-	 * thrown error; a missing channel, an internal route or an unknown connection always throws.
+	 * thrown error. Authorization denials always produce rejected envelopes so optimistic clients can
+	 * reconcile; a missing channel, an internal route or an unknown connection always throws.
 	 */
 	async dispatchFrom(
 		connection: DurableChannelConnection<TPrincipal>,
@@ -512,7 +530,10 @@ export class DurableChannelHub<
 		if (definition.state !== undefined) {
 			await this.#instance(uri, "exec");
 		}
-		if (connection !== undefined) this.#link(connection);
+		if (connection !== undefined) {
+			await this.#authorize(connection, uri, { type: "command", name, params: parsed.output }, DurableChannelPermission.Execute);
+			this.#link(connection);
+		}
 		const result = await command.handler(parsed.output as never, this.#context(uri, match.params, options));
 		const validated = safeParse(command.result, result);
 		if (!validated.success) {
@@ -717,6 +738,39 @@ export class DurableChannelHub<
 		aborter.abort();
 	}
 
+	/** Policies run only for remote entry points. Revalidate the connection after asynchronous policy work. */
+	async #authorize(
+		connection: DurableChannelConnection<TPrincipal>,
+		uri: string,
+		request: DurableChannelAuthorizationRequest,
+		permission: DurableChannelPermission,
+	): Promise<void> {
+		this.#link(connection);
+		const match = this.#reachable(uri);
+		const authorize = match.route.definition.authorize;
+		if (authorize === undefined) return;
+		let permissions: number = DurableChannelPermission.None;
+		try {
+			permissions = await authorize({
+				env: this.#env,
+				uri,
+				params: match.params,
+				connectionId: connection.id,
+				principal: connection.principal,
+				state: () => match.route.definition.state === undefined ? Promise.resolve(undefined) : this.get(uri),
+			}, request);
+		} catch {
+			// A failed policy never admits an operation or exposes server exception details to a peer.
+		}
+		this.#link(connection);
+		if (
+			!Number.isInteger(permissions) || permissions < 0 || permissions > DurableChannelPermission.All ||
+			(permissions & permission) !== permission
+		) {
+			throw new PermissionDeniedError();
+		}
+	}
+
 	#action(instance: Instance<TEnv, TPrincipal>, name: string): DurableChannelActionDefinition<unknown, TEnv, TPrincipal> | undefined {
 		const actions = instance.route.definition.actions;
 		return Object.hasOwn(actions, name) ? actions[name] : undefined;
@@ -811,6 +865,15 @@ export class DurableChannelHub<
 			if (connection !== undefined) this.#link(connection);
 			let reason = rejectionReason;
 			let state = instance.state;
+			if (reason === undefined && action !== undefined && connection !== undefined) {
+				try {
+					await this.#authorize(connection, instance.uri, { type: "action", name, payload }, DurableChannelPermission.Dispatch);
+					this.#link(connection);
+				} catch (error) {
+					if (!(error instanceof PermissionDeniedError)) throw error;
+					reason = reasonOf(error);
+				}
+			}
 			if (reason === undefined && action !== undefined) {
 				try {
 					const reduced = action.reduce(instance.state, payload, {

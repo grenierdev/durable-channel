@@ -21,6 +21,47 @@ export interface DurableChannelPrincipal {
 	readonly id: string;
 }
 
+/** Client permissions returned by a channel's server-side policy. Combine flags with `|`. */
+export const DurableChannelPermission = {
+	None: 0,
+	Subscribe: 1,
+	Dispatch: 2,
+	Execute: 4,
+	All: 7,
+} as const;
+
+export type DurableChannelPermission = typeof DurableChannelPermission[keyof typeof DurableChannelPermission];
+
+/** The operation being authorized. Action payloads and command params have passed their schemas. */
+export type DurableChannelAuthorizationRequest =
+	| { readonly type: "subscribe" }
+	| { readonly type: "action"; readonly name: string; readonly payload: unknown }
+	| { readonly type: "command"; readonly name: string; readonly params: unknown };
+
+/** Server-only inputs to a client policy. Principals remain optional, including for anonymous callers. */
+export interface DurableChannelAuthorizationContext<
+	TEnv = unknown,
+	TState = unknown,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
+> {
+	readonly env: TEnv;
+	readonly uri: string;
+	readonly params: Readonly<Record<string, string>>;
+	readonly connectionId: string;
+	readonly principal: Readonly<TPrincipal> | undefined;
+	state(): Promise<TState>;
+}
+
+/** Runs only on the server, before admitting a client operation. */
+export type DurableChannelAuthorizationHandler<
+	TEnv = unknown,
+	TState = unknown,
+	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
+> = (
+	ctx: DurableChannelAuthorizationContext<TEnv, TState, TPrincipal>,
+	request: DurableChannelAuthorizationRequest,
+) => number | Promise<number>;
+
 /** The connection that dispatched an action, and its own sequence number for it. */
 export interface DurableChannelActionOrigin {
 	readonly clientId: string;
@@ -238,6 +279,8 @@ export interface DurableChannel<
 	TNotifications extends DurableChannelNotificationMap = DurableChannelNotificationMap,
 	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
 > {
+	/** Optional server-side policy for client subscriptions, actions and commands. */
+	readonly authorize?: DurableChannelAuthorizationHandler<TEnv, TState, TPrincipal>;
 	/** A one-line description, for the generated document. */
 	readonly summary?: string;
 	/** The state schema, or `undefined` for a stateless channel. */
@@ -543,15 +586,23 @@ export class DurableChannelStatelessBuilder<
 	#commands: readonly AnyCommandBuilder[];
 	#notifications: readonly AnyNotificationBuilder[];
 	#summary: string | undefined;
+	#authorize: DurableChannelAuthorizationHandler<TEnv, unknown, TPrincipal> | undefined;
 
-	constructor(commands: readonly AnyCommandBuilder[] = [], notifications: readonly AnyNotificationBuilder[] = [], summary?: string) {
+	constructor(
+		commands: readonly AnyCommandBuilder[] = [],
+		notifications: readonly AnyNotificationBuilder[] = [],
+		summary?: string,
+		authorize?: DurableChannelAuthorizationHandler<TEnv, unknown, TPrincipal>,
+	) {
 		this.#commands = commands;
 		this.#notifications = notifications;
 		this.#summary = summary;
+		this.#authorize = authorize;
 	}
 
 	build(): DurableChannel<TEnv, undefined, Record<never, never>, TCommands, TNotifications, TPrincipal> {
 		return Object.freeze({
+			...(this.#authorize !== undefined ? { authorize: this.#authorize } : {}),
 			...(this.#summary !== undefined ? { summary: this.#summary } : {}),
 			state: undefined,
 			initialState: undefined,
@@ -567,17 +618,35 @@ export class DurableChannelStatelessBuilder<
 			this.#commands,
 			this.#notifications,
 			this.#summary,
+			this.#authorize as never,
 		);
 	}
 
 	/** Declares the trusted caller type; the host validates and supplies its value. */
 	principal<TNewPrincipal extends TPrincipal>(): DurableChannelStatelessBuilder<TEnv, TCommands, TNotifications, TNewPrincipal> {
-		return new DurableChannelStatelessBuilder(this.#commands, this.#notifications, this.#summary);
+		return new DurableChannelStatelessBuilder<TEnv, TCommands, TNotifications, TNewPrincipal>(
+			this.#commands,
+			this.#notifications,
+			this.#summary,
+			this.#authorize,
+		);
+	}
+
+	/** Authorizes client operations on the server. Omit the handler to allow all permissions. */
+	client(
+		authorize?: DurableChannelAuthorizationHandler<TEnv, unknown, TPrincipal>,
+	): DurableChannelStatelessBuilder<TEnv, TCommands, TNotifications, TPrincipal> {
+		return new DurableChannelStatelessBuilder(this.#commands, this.#notifications, this.#summary, authorize);
 	}
 
 	/** A one-line description of the channel, carried into the generated document. */
 	summary(summary: string): DurableChannelStatelessBuilder<TEnv, TCommands, TNotifications, TPrincipal> {
-		return new DurableChannelStatelessBuilder<TEnv, TCommands, TNotifications, TPrincipal>(this.#commands, this.#notifications, summary);
+		return new DurableChannelStatelessBuilder<TEnv, TCommands, TNotifications, TPrincipal>(
+			this.#commands,
+			this.#notifications,
+			summary,
+			this.#authorize,
+		);
 	}
 
 	/** Declares the state and its initial value, which is what unlocks `.action()`. */
@@ -585,7 +654,15 @@ export class DurableChannelStatelessBuilder<
 		schema: TSchema,
 		initialState: InferInput<TSchema>,
 	): DurableChannelBuilder<TEnv, InferOutput<TSchema>, Record<never, never>, TCommands, TNotifications, TPrincipal> {
-		return new DurableChannelBuilder(schema, initialState, [], this.#commands, this.#notifications, this.#summary);
+		return new DurableChannelBuilder<TEnv, InferOutput<TSchema>, Record<never, never>, TCommands, TNotifications, TPrincipal>(
+			schema,
+			initialState,
+			[],
+			this.#commands,
+			this.#notifications,
+			this.#summary,
+			this.#authorize,
+		);
 	}
 
 	command<TName extends string, TParams extends GenericSchema, TResult extends GenericSchema>(
@@ -606,6 +683,7 @@ export class DurableChannelStatelessBuilder<
 			[...this.#commands, builder(new DurableChannelCommandBuilder()) as never],
 			this.#notifications,
 			this.#summary,
+			this.#authorize,
 		);
 	}
 
@@ -616,6 +694,7 @@ export class DurableChannelStatelessBuilder<
 			this.#commands,
 			[...this.#notifications, builder(new DurableChannelNotificationBuilder())],
 			this.#summary,
+			this.#authorize,
 		);
 	}
 }
@@ -635,6 +714,7 @@ export class DurableChannelBuilder<
 	#commands: readonly AnyCommandBuilder[];
 	#notifications: readonly AnyNotificationBuilder[];
 	#summary: string | undefined;
+	#authorize: DurableChannelAuthorizationHandler<TEnv, TState, TPrincipal> | undefined;
 
 	constructor(
 		state: GenericSchema,
@@ -643,6 +723,7 @@ export class DurableChannelBuilder<
 		commands: readonly AnyCommandBuilder[] = [],
 		notifications: readonly AnyNotificationBuilder[] = [],
 		summary?: string,
+		authorize?: DurableChannelAuthorizationHandler<TEnv, TState, TPrincipal>,
 	) {
 		this.#state = state;
 		this.#initialState = initialState;
@@ -650,6 +731,7 @@ export class DurableChannelBuilder<
 		this.#commands = commands;
 		this.#notifications = notifications;
 		this.#summary = summary;
+		this.#authorize = authorize;
 	}
 
 	/** Parses the initial state through the state schema, so defaults are applied once and for all. */
@@ -659,6 +741,7 @@ export class DurableChannelBuilder<
 			throw new InvalidStateError("<initial>");
 		}
 		return Object.freeze({
+			...(this.#authorize !== undefined ? { authorize: this.#authorize } : {}),
 			...(this.#summary !== undefined ? { summary: this.#summary } : {}),
 			state: this.#state,
 			initialState: parsed.output,
@@ -670,17 +753,56 @@ export class DurableChannelBuilder<
 	}
 
 	env<TNewEnv>(): DurableChannelBuilder<TNewEnv, TState, TActions, TCommands, TNotifications, TPrincipal> {
-		return new DurableChannelBuilder(this.#state, this.#initialState, this.#actions, this.#commands, this.#notifications, this.#summary);
+		return new DurableChannelBuilder(
+			this.#state,
+			this.#initialState,
+			this.#actions,
+			this.#commands,
+			this.#notifications,
+			this.#summary,
+			this.#authorize as never,
+		);
 	}
 
 	/** Declares the trusted caller type; reducers receive only its recorded ID. */
 	principal<TNewPrincipal extends TPrincipal>(): DurableChannelBuilder<TEnv, TState, TActions, TCommands, TNotifications, TNewPrincipal> {
-		return new DurableChannelBuilder(this.#state, this.#initialState, this.#actions, this.#commands, this.#notifications, this.#summary);
+		return new DurableChannelBuilder<TEnv, TState, TActions, TCommands, TNotifications, TNewPrincipal>(
+			this.#state,
+			this.#initialState,
+			this.#actions,
+			this.#commands,
+			this.#notifications,
+			this.#summary,
+			this.#authorize,
+		);
+	}
+
+	/** Authorizes client operations on the server; clients still reduce optimistically. */
+	client(
+		authorize?: DurableChannelAuthorizationHandler<TEnv, TState, TPrincipal>,
+	): DurableChannelBuilder<TEnv, TState, TActions, TCommands, TNotifications, TPrincipal> {
+		return new DurableChannelBuilder(
+			this.#state,
+			this.#initialState,
+			this.#actions,
+			this.#commands,
+			this.#notifications,
+			this.#summary,
+			authorize,
+		);
 	}
 
 	/** A one-line description of the channel, carried into the generated document. */
 	summary(summary: string): DurableChannelBuilder<TEnv, TState, TActions, TCommands, TNotifications, TPrincipal> {
-		return new DurableChannelBuilder(this.#state, this.#initialState, this.#actions, this.#commands, this.#notifications, summary);
+		return new DurableChannelBuilder(
+			this.#state,
+			this.#initialState,
+			this.#actions,
+			this.#commands,
+			this.#notifications,
+			summary,
+			this.#authorize,
+		);
 	}
 
 	action<TName extends string, TPayload extends GenericSchema>(
@@ -695,6 +817,7 @@ export class DurableChannelBuilder<
 			this.#commands,
 			this.#notifications,
 			this.#summary,
+			this.#authorize,
 		);
 	}
 
@@ -717,6 +840,7 @@ export class DurableChannelBuilder<
 			[...this.#commands, builder(new DurableChannelCommandBuilder()) as never],
 			this.#notifications,
 			this.#summary,
+			this.#authorize,
 		);
 	}
 
@@ -730,6 +854,7 @@ export class DurableChannelBuilder<
 			this.#commands,
 			[...this.#notifications, builder(new DurableChannelNotificationBuilder())],
 			this.#summary,
+			this.#authorize,
 		);
 	}
 }
