@@ -1,4 +1,5 @@
 import { deepStrictEqual, ok, rejects, throws } from "node:assert/strict";
+import { IDBFactory } from "fake-indexeddb";
 import * as v from "valibot";
 import { describe, it } from "vitest";
 import {
@@ -15,6 +16,7 @@ import {
 	durableChannel,
 	durableRoutes,
 	IdentityChangedError,
+	IndexedDBClientStorage,
 	InMemoryTransport,
 	MemoryStorage,
 	NotInitializedError,
@@ -580,3 +582,33 @@ function typeChecks() {
 	});
 }
 void typeChecks;
+
+describe("persisted client identity", () => {
+	it("restores the public principal and clears the checkpoint when the authenticated identity changes", async () => {
+		const host = boot();
+		const store = new IndexedDBClientStorage("tab", { indexedDB: new IDBFactory() });
+		const first = host.serve(alice);
+		const client = new DurableChannelClient(routes, first.transport, { storage: store });
+		const next = host.serve(bob);
+		const restored = new DurableChannelClient(routes, next.transport, { storage: store });
+		try {
+			client.connect();
+			await client.hello({ subscriptions: ["room://"] });
+			await client.dispatch("room://", "post", { author: "alice" }).settled;
+			await client.shutdown();
+			await restored.ready();
+			deepStrictEqual(restored.principal, { id: "alice" });
+			deepStrictEqual(restored.state("room://"), { authors: ["alice"] });
+			restored.connect();
+			await rejects(restored.reconnect(), IdentityChangedError);
+			throws(() => restored.state("room://"));
+			deepStrictEqual(await store.load(), undefined);
+			deepStrictEqual(restored.connectionState, { status: "closed", reason: { type: "shutdown" } });
+		} finally {
+			await client.shutdown();
+			await restored.shutdown();
+			await Promise.all([first.loop, next.loop]);
+			await host.hub.close();
+		}
+	});
+});

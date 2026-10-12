@@ -9,13 +9,20 @@
 
 import { deepStrictEqual, ok, rejects, throws } from "node:assert/strict";
 import { upgradeWebSocket } from "@hono/node-server";
+import { IDBFactory } from "fake-indexeddb";
 import { Hono } from "hono";
 import * as v from "valibot";
 import { describe, it } from "vitest";
 import type { WebSocket } from "ws";
 import { serveApp } from "../test/server.ts";
 import { durableChannel } from "./channel.ts";
-import { DurableChannelClient, type DurableChannelClientEvent, type DurableChannelSubscription } from "./client.ts";
+import {
+	DurableChannelClient,
+	type DurableChannelClientEvent,
+	type DurableChannelClientOptions,
+	type DurableChannelSubscription,
+} from "./client.ts";
+import { IndexedDBClientStorage } from "./client-storage.ts";
 import { ChannelNotFoundError, NotClientDispatchableError, RejectAction, RpcError, UnknownActionError } from "./error.ts";
 import { type DurableChannelConnection, DurableChannelHub } from "./hub.ts";
 import { durableRoutes } from "./routes.ts";
@@ -318,9 +325,9 @@ function boot(options?: { replayLimit?: number }) {
 		return served;
 	}
 
-	async function open(clientId: string, subscriptions?: readonly string[]) {
+	async function open(clientId: string, subscriptions?: readonly string[], options?: DurableChannelClientOptions) {
 		const link = serve();
-		const client = new DurableChannelClient(routes, link.transport, { clientId, requestTimeoutMs: 5000 });
+		const client = new DurableChannelClient(routes, link.transport, { clientId, requestTimeoutMs: 5000, ...options });
 		clients.push(client as never);
 		client.connect();
 		if (subscriptions !== undefined) {
@@ -329,11 +336,19 @@ function boot(options?: { replayLimit?: number }) {
 		return { client, link };
 	}
 
+	function restore(options: DurableChannelClientOptions) {
+		const link = serve();
+		const client = new DurableChannelClient(routes, link.transport, { requestTimeoutMs: 5000, ...options });
+		clients.push(client as never);
+		return { client, link };
+	}
+
 	return {
 		hub,
 		rpc,
 		serve,
 		open,
+		restore,
 		newGame: (id: string) => hub.of("game:/:id").create({ id }),
 		newRoom: (name: string) => hub.of("room:/:name").create({ name }),
 		async stop(): Promise<void> {
@@ -800,6 +815,271 @@ describe("DurableChannelClient over a WebSocket", () => {
 			}
 			await withTimeout(hub.close(), "the hub to close");
 			await withTimeout(listener.stop(), "the listener to shut down");
+		}
+	});
+});
+
+describe("DurableChannelClient persistence", () => {
+	function storage() {
+		return new IndexedDBClientStorage("tab-1", { indexedDB: new IDBFactory() });
+	}
+
+	it("recreates a client over existing IndexedDB data and reconnects to replay offline changes", async () => {
+		const host = boot();
+		const indexedDB = new IDBFactory();
+		const originalStorage = new IndexedDBClientStorage("tab-1", { indexedDB });
+		try {
+			await host.newRoom("lobby");
+			const { client: original } = await host.open("alice", ["room:/lobby"], { storage: originalStorage });
+			await original.dispatch("room:/lobby", "room/said", { author: "alice", text: "before refresh" }).settled;
+			await original.shutdown();
+
+			const offlineAction = await host.hub.dispatch("room:/lobby", "room/systemSaid", { text: "while offline" });
+			const newLink = host.serve();
+			const recreated = new DurableChannelClient(routes, newLink.transport, {
+				storage: new IndexedDBClientStorage("tab-1", { indexedDB }),
+				requestTimeoutMs: 5000,
+			});
+			try {
+				deepStrictEqual(await recreated.ready(), true);
+				deepStrictEqual(recreated.clientId, "alice");
+				deepStrictEqual(recreated.subscriptions, ["room:/lobby"]);
+				deepStrictEqual(recreated.lastSeenServerSeq, 1);
+				deepStrictEqual(recreated.confirmed("room:/lobby"), { messages: [{ author: "alice", text: "before refresh" }] });
+
+				recreated.connect();
+				const result = await recreated.reconnect();
+				ok(result.type === "replay");
+				deepStrictEqual(result.actions, [offlineAction]);
+				deepStrictEqual(result.missing, []);
+				deepStrictEqual(recreated.lastSeenServerSeq, offlineAction.serverSeq);
+				deepStrictEqual(recreated.confirmed("room:/lobby"), {
+					messages: [
+						{ author: "alice", text: "before refresh" },
+						{ author: "system", text: "while offline" },
+					],
+				});
+				deepStrictEqual(recreated.state("room:/lobby"), await host.hub.get("room:/lobby"));
+
+				const liveAction = await host.hub.dispatch("room:/lobby", "room/systemSaid", { text: "after reconnect" });
+				await until("the recreated subscription to receive a live broadcast", () => recreated.lastSeenServerSeq === liveAction.serverSeq);
+				deepStrictEqual(recreated.state("room:/lobby"), await host.hub.get("room:/lobby"));
+				const next = recreated.dispatch("room:/lobby", "room/said", { author: "alice", text: "from recreated client" });
+				deepStrictEqual(next.clientSeq, 2);
+				deepStrictEqual((await next.settled).status, "confirmed");
+				deepStrictEqual(recreated.state("room:/lobby"), await host.hub.get("room:/lobby"));
+			} finally {
+				await recreated.shutdown();
+			}
+		} finally {
+			await host.stop();
+		}
+	});
+
+	it("automatically saves confirmed and rejected envelopes even when optimism does not change", async () => {
+		const host = boot();
+		const store = storage();
+		try {
+			await host.newRoom("lobby");
+			const { client } = await host.open("alice", ["room:/lobby"], { storage: store });
+			await client.dispatch("room:/lobby", "room/said", { author: "alice", text: "saved" }).settled;
+			deepStrictEqual(
+				(
+					await client.dispatch("room:/lobby", "log/messagePosted", {
+						author: "wrong",
+						text: "rejected",
+						clientSeq: 2,
+					}).settled
+				).status,
+				"rejected",
+			);
+			await withTimeout(
+				(async () => {
+					while (true) {
+						const saved = (await store.load()) as
+							| { lastSeenServerSeq: number; channels: { pending: unknown[]; confirmed: unknown }[] }
+							| undefined;
+						if (saved?.lastSeenServerSeq === 2 && saved.channels[0].pending.length === 0) {
+							deepStrictEqual(saved.channels[0].confirmed, { messages: [{ author: "alice", text: "saved" }] });
+							break;
+						}
+						await new Promise((resolve) => setTimeout(resolve, 1));
+					}
+				})(),
+				"the automatic checkpoint",
+			);
+		} finally {
+			await host.stop();
+		}
+	});
+
+	it("restores confirmed state, subscriptions, identity and sequence numbers after shutdown", async () => {
+		const host = boot();
+		const store = storage();
+		try {
+			await host.newRoom("lobby");
+			const { client } = await host.open("alice", ["room:/lobby"], { storage: store });
+			await client.dispatch("room:/lobby", "room/said", { author: "alice", text: "saved" }).settled;
+			await client.shutdown();
+			const restored = host.restore({ storage: store }).client;
+			deepStrictEqual(await restored.ready(), true);
+			deepStrictEqual(restored.clientId, "alice");
+			deepStrictEqual(restored.subscriptions, ["room:/lobby"]);
+			deepStrictEqual(restored.lastSeenServerSeq, 1);
+			deepStrictEqual(restored.state("room:/lobby"), { messages: [{ author: "alice", text: "saved" }] });
+			restored.connect();
+			await restored.reconnect();
+			const next = restored.dispatch("room:/lobby", "room/said", { author: "alice", text: "next" });
+			deepStrictEqual(next.clientSeq, 2);
+			deepStrictEqual((await next.settled).status, "confirmed");
+		} finally {
+			await host.stop();
+		}
+	});
+
+	it("restores pending optimism and reconciles a lost reply through replay", async () => {
+		const host = boot();
+		const store = storage();
+		try {
+			await host.newRoom("lobby");
+			const { client, link } = await host.open("alice", ["room:/lobby"], { storage: store });
+			link.mute();
+			client.dispatch("room:/lobby", "log/messagePosted", { author: "alice", text: "pending", clientSeq: 1 });
+			await until("the action to commit", () => host.hub.serverSeq === 1);
+			link.close();
+			await until("the transport to close", () => client.connectionState.status === "closed");
+			await client.flushPersistence();
+			const restored = host.restore({ storage: store }).client;
+			await restored.ready();
+			deepStrictEqual(restored.confirmed("room:/lobby"), { messages: [] });
+			deepStrictEqual(restored.state("room:/lobby"), { messages: [{ author: "alice", text: "pending" }] });
+			deepStrictEqual(restored.pending("room:/lobby").length, 1);
+			// Stop the previous instance before letting the new one become the checkpoint writer.
+			await client.shutdown();
+			restored.connect();
+			deepStrictEqual((await restored.reconnect()).type, "replay");
+			deepStrictEqual(restored.pending("room:/lobby"), []);
+			deepStrictEqual(restored.state("room:/lobby"), await host.hub.get("room:/lobby"));
+			await restored.flushPersistence();
+			const again = host.restore({ storage: store }).client;
+			await again.ready();
+			deepStrictEqual(again.pending("room:/lobby"), []);
+		} finally {
+			await host.stop();
+		}
+	});
+
+	it("falls back to snapshots when a restored checkpoint is outside the replay ring", async () => {
+		const host = boot({ replayLimit: 1 });
+		const store = storage();
+		try {
+			await host.newRoom("lobby");
+			const { client } = await host.open("alice", ["room:/lobby"], { storage: store });
+			await client.shutdown();
+			await host.hub.dispatch("room:/lobby", "room/systemSaid", { text: "one" });
+			await host.hub.dispatch("room:/lobby", "room/systemSaid", { text: "two" });
+			const restored = host.restore({ storage: store }).client;
+			await restored.ready();
+			restored.connect();
+			deepStrictEqual((await restored.reconnect()).type, "snapshot");
+			deepStrictEqual(restored.state("room:/lobby"), await host.hub.get("room:/lobby"));
+		} finally {
+			await host.stop();
+		}
+	});
+
+	it("persists unsubscribe after a transport closes", async () => {
+		const host = boot();
+		const store = storage();
+		try {
+			await host.newRoom("lobby");
+			const { client, link } = await host.open("alice", ["room:/lobby"], { storage: store });
+			await client.flushPersistence();
+			link.close();
+			await until("the transport to close", () => client.connectionState.status === "closed");
+			await client.unsubscribe("room:/lobby");
+			await client.shutdown();
+			const restored = host.restore({ storage: store }).client;
+			await restored.ready();
+			deepStrictEqual(restored.subscriptions, []);
+			throws(() => restored.state("room:/lobby"), ChannelNotFoundError);
+		} finally {
+			await host.stop();
+		}
+	});
+
+	it("rejects corrupted checkpoints and mismatched client identities before restoring state", async () => {
+		const host = boot();
+		const store = storage();
+		try {
+			await host.newRoom("lobby");
+			const { client } = await host.open("alice", ["room:/lobby"], { storage: store });
+			await client.shutdown();
+			const wrong = host.restore({ clientId: "bob", storage: store }).client;
+			await rejects(wrong.ready(), /client ID/);
+			await rejects(wrong.shutdown(), /client ID/);
+			const saved = (await store.load()) as { channels: { confirmed: unknown }[] };
+			saved.channels[0].confirmed = { messages: "invalid" };
+			const invalid = host.restore({ storage: { load: async () => saved, save: async () => {}, clear: async () => {} } }).client;
+			await rejects(invalid.ready(), /channel schema/);
+			throws(() => invalid.state("room:/lobby"), ChannelNotFoundError);
+			await rejects(invalid.shutdown(), /channel schema/);
+		} finally {
+			await host.stop();
+		}
+	});
+
+	it("closes the client even when its final checkpoint cannot be saved", async () => {
+		const host = boot();
+		try {
+			await host.newRoom("lobby");
+			const { client } = await host.open("alice", ["room:/lobby"], {
+				storage: {
+					load: async () => undefined,
+					save: async () => {
+						throw new Error("storage failed");
+					},
+					clear: async () => {},
+				},
+			});
+			await rejects(client.shutdown(), /storage failed/);
+			deepStrictEqual(client.connectionState, { status: "closed", reason: { type: "shutdown" } });
+			deepStrictEqual(client.subscriptions, []);
+		} finally {
+			await host.stop();
+		}
+	});
+
+	it("reports failed saves, blocks sending unsaved actions, and retries on flush", async () => {
+		const host = boot();
+		const store = storage();
+		let fail = true;
+		const errors: unknown[] = [];
+		try {
+			await host.newRoom("lobby");
+			const { client } = await host.open("alice", ["room:/lobby"], {
+				storage: {
+					load: () => store.load(),
+					save: async (checkpoint) => {
+						if (fail) throw new Error("quota exceeded");
+						await store.save(checkpoint);
+					},
+					clear: () => store.clear(),
+				},
+				onPersistenceError: (error) => errors.push(error),
+			});
+			await rejects(client.flushPersistence(), /quota exceeded/);
+			const action = client.dispatch("room:/lobby", "room/said", { author: "alice", text: "unsaved" });
+			deepStrictEqual((await action.settled).status, "lost");
+			deepStrictEqual(host.hub.serverSeq, 0);
+			ok(errors.length > 0);
+			fail = false;
+			await client.flushPersistence();
+			deepStrictEqual(client.pending("room:/lobby"), []);
+			ok(await store.load());
+		} finally {
+			fail = false;
+			await host.stop();
 		}
 	});
 });

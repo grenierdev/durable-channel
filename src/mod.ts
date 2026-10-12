@@ -1,5 +1,6 @@
 export * from "./channel.ts";
 export * from "./client.ts";
+export * from "./client-storage.ts";
 export * from "./document.ts";
 export * from "./error.ts";
 export * from "./hub.ts";

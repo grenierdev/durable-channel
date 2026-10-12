@@ -46,6 +46,7 @@
 		"@microsoft/agent-host-protocol": "0.9.0",
 		"@types/node": "^24.13.3",
 		"@types/ws": "^8.18.1",
+		"fake-indexeddb": "^6.2.5",
 		"hono": "^4.12.28",
 		"typescript": "^7.0.2",
 		"vitest": "^5.0.3",

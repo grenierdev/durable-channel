@@ -26,6 +26,7 @@ import type {
 	DurableChannelReconnectResult,
 	DurableChannelSnapshot,
 } from "./channel.ts";
+import type { DurableChannelClientCheckpoint, DurableChannelClientStorage } from "./client-storage.ts";
 import {
 	ChannelNotFoundError,
 	ClientClosedError,
@@ -148,6 +149,10 @@ export interface DurableChannelClientOptions {
 	readonly requestTimeoutMs?: number;
 	/** How many events one subscription buffers before the oldest are dropped. Default 4096. */
 	readonly subscriptionBuffer?: number;
+	/** Opt-in persistence. Await `ready()` to restore, then reconnect when it returns `true`. */
+	readonly storage?: DurableChannelClientStorage;
+	/** Reports background checkpoint failures. `flushPersistence()` also rejects on a failed save. */
+	readonly onPersistenceError?: (error: unknown) => void;
 }
 
 // ─── Fan-out ─────────────────────────────────────────────────────────────────
@@ -349,6 +354,22 @@ const HelloResultSchema = v.object({
 	principal: v.exactOptional(DurableChannelWirePrincipal),
 });
 const SubscribeResultSchema = v.object({ snapshot: v.optional(DurableChannelWireSnapshot) });
+const SequenceSchema = v.pipe(v.number(), v.safeInteger(), v.minValue(0));
+const CheckpointSchema = v.object({
+	version: v.literal(1),
+	clientId: v.pipe(v.string(), v.minLength(1)),
+	principal: v.exactOptional(DurableChannelWirePrincipal),
+	nextClientSeq: v.pipe(SequenceSchema, v.minValue(1)),
+	lastSeenServerSeq: SequenceSchema,
+	channels: v.array(
+		v.object({
+			uri: v.string(),
+			confirmed: v.unknown(),
+			appliedSeq: SequenceSchema,
+			pending: v.array(v.object({ clientSeq: v.pipe(SequenceSchema, v.minValue(1)), name: v.string(), payload: v.unknown() })),
+		}),
+	),
+});
 const ReconnectResultSchema = v.variant("type", [
 	v.object({
 		type: v.literal("replay"),
@@ -404,6 +425,15 @@ export class DurableChannelClient<
 	#lastSeenServerSeq = 0;
 	#loop: Promise<void> | undefined;
 	#done = false;
+	#storage: DurableChannelClientStorage | undefined;
+	#configuredClientId: string | undefined;
+	#onPersistenceError: ((error: unknown) => void) | undefined;
+	#ready: Promise<boolean> | undefined;
+	#checkpointWritable = false;
+	#persistScheduled = false;
+	#persistQueue: Promise<void> = Promise.resolve();
+	#persistError: unknown;
+	#persistFailed = false;
 
 	constructor(
 		routes: DurableChannelRoutes<TEnv, TRoutes, TPrincipal>,
@@ -413,11 +443,151 @@ export class DurableChannelClient<
 		this.#routes = routes;
 		this.#transport = transport;
 		this.#clientId = options?.clientId ?? crypto.randomUUID();
+		this.#configuredClientId = options?.clientId;
+		this.#storage = options?.storage;
+		this.#onPersistenceError = options?.onPersistenceError;
 		const timeout = options?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 		this.#requestTimeoutMs = timeout > 0 ? timeout : 0;
 		this.#subscriptionBuffer = options?.subscriptionBuffer ?? DEFAULT_SUBSCRIPTION_BUFFER;
 		this.#events = new BroadcastQueue(this.#subscriptionBuffer);
 		this.#states = new BroadcastQueue(this.#subscriptionBuffer);
+	}
+
+	/** Restores a saved checkpoint once. Returns `true` when this client should reconnect instead of hello. */
+	ready(): Promise<boolean> {
+		this.#ready ??= this.#restore();
+		return this.#ready;
+	}
+
+	/** Waits for the current checkpoint to commit. A failed background save is retried here. */
+	async flushPersistence(): Promise<void> {
+		await this.ready();
+		this.#persist();
+		await Promise.resolve();
+		let queued: Promise<void>;
+		do {
+			queued = this.#persistQueue;
+			await queued;
+		} while (queued !== this.#persistQueue || this.#persistScheduled);
+		if (this.#persistFailed) throw this.#persistError;
+	}
+
+	async #restore(): Promise<boolean> {
+		if (this.#storage === undefined) return false;
+		const stored = await this.#storage.load();
+		if (stored === undefined) return false;
+		const checkpoint = v.parse(CheckpointSchema, stored);
+		if (this.#configuredClientId !== undefined && this.#configuredClientId !== checkpoint.clientId) {
+			throw new Error("The saved client ID does not match the configured client ID");
+		}
+		// Validate the entire checkpoint before changing any live state.
+		const uris = new Set<string>();
+		const sequences = new Set<number>();
+		for (const channel of checkpoint.channels) {
+			const match = matchRoute(this.#routes, channel.uri);
+			if (match === undefined || uris.has(channel.uri) || channel.appliedSeq > checkpoint.lastSeenServerSeq) {
+				throw new Error(`Invalid saved channel: ${channel.uri}`);
+			}
+			uris.add(channel.uri);
+			const definition = match.route.definition;
+			if (definition.state !== undefined && !v.safeParse(definition.state, channel.confirmed).success) {
+				throw new Error(`The saved state does not match the channel schema: ${channel.uri}`);
+			}
+			let previous = 0;
+			for (const pending of channel.pending) {
+				const action = Object.hasOwn(definition.actions, pending.name) ? definition.actions[pending.name] : undefined;
+				if (
+					definition.state === undefined ||
+					action?.client !== true ||
+					!v.safeParse(action.payload, pending.payload).success ||
+					pending.clientSeq <= previous ||
+					pending.clientSeq >= checkpoint.nextClientSeq ||
+					sequences.has(pending.clientSeq)
+				) {
+					throw new Error(`Invalid saved pending action: ${channel.uri}`);
+				}
+				previous = pending.clientSeq;
+				sequences.add(pending.clientSeq);
+			}
+		}
+		this.#clientId = checkpoint.clientId;
+		this.#principal = checkpoint.principal === undefined ? undefined : Object.freeze({ id: checkpoint.principal.id });
+		this.#nextClientSeq = checkpoint.nextClientSeq;
+		this.#lastSeenServerSeq = checkpoint.lastSeenServerSeq;
+		this.#initialized = true;
+		for (const channel of checkpoint.channels) {
+			const mirror = this.#mirror(channel.uri);
+			mirror.confirmed = channel.confirmed;
+			mirror.appliedSeq = channel.appliedSeq;
+			mirror.pending = channel.pending.map((pending) => {
+				const entry: PendingEntry = {
+					...pending,
+					origin: Object.freeze({
+						clientId: this.#clientId,
+						clientSeq: pending.clientSeq,
+						...(this.#principal === undefined ? {} : { principalId: this.#principal.id }),
+					}),
+					settled: false,
+					settle: () => {
+						entry.settled = true;
+						this.#pendingEntries.delete(entry);
+					},
+				};
+				this.#pendingEntries.add(entry);
+				return entry;
+			});
+			this.#subscribed.add(channel.uri);
+			this.#restate(mirror, true);
+		}
+		this.#checkpointWritable = true;
+		return true;
+	}
+
+	#persist(): void {
+		if (this.#storage === undefined || !this.#checkpointWritable || this.#done || this.#persistScheduled) return;
+		this.#persistScheduled = true;
+		queueMicrotask(() => {
+			this.#persistScheduled = false;
+			if (!this.#checkpointWritable || this.#done) return;
+			try {
+				const checkpoint: DurableChannelClientCheckpoint = structuredClone({
+					version: 1,
+					clientId: this.#clientId,
+					...(this.#principal === undefined ? {} : { principal: this.#principal }),
+					nextClientSeq: this.#nextClientSeq,
+					lastSeenServerSeq: this.#lastSeenServerSeq,
+					channels: [...this.#subscribed].map((uri) => {
+						const mirror = this.#mirrors.get(uri)!;
+						return {
+							uri,
+							confirmed: mirror.confirmed,
+							appliedSeq: mirror.appliedSeq,
+							pending: mirror.pending.map(({ clientSeq, name, payload }) => ({ clientSeq, name, payload })),
+						};
+					}),
+				});
+				this.#persistQueue = this.#persistQueue
+					.then(async () => {
+						await this.#storage!.save(checkpoint);
+						this.#persistFailed = false;
+						this.#persistError = undefined;
+					})
+					.catch((error: unknown) => this.#persistenceFailure(error));
+			} catch (error) {
+				// Report cloning failures in queue order so an older successful save cannot hide them.
+				this.#persistQueue = this.#persistQueue.then(() => this.#persistenceFailure(error));
+			}
+		});
+	}
+
+	#persistenceFailure(error: unknown): void {
+		this.#persistFailed = true;
+		this.#persistError = error;
+		try {
+			this.#onPersistenceError?.(error);
+		} catch {
+			/* A reporting callback cannot break the client. */
+		}
 	}
 
 	/** The identity the hub knows this client by, across every transport it reconnects on. */
@@ -468,11 +638,20 @@ export class DurableChannelClient<
 	/**
 	 * Closes the transport, fails every request in flight with {@link ClientClosedError}, settles every
 	 * pending action `lost` and ends every subscription and event stream. A shut-down client is done:
-	 * `reconnect` will not revive it.
+	 * `reconnect` will not revive it. When storage is enabled, saves its checkpoint first so a new client
+	 * can resume it. A persistence failure rejects shutdown after closing the transport and streams.
 	 */
 	async shutdown(): Promise<void> {
 		if (this.#done) {
 			return;
+		}
+		let persistenceError: unknown;
+		let persistenceFailed = false;
+		try {
+			await this.flushPersistence();
+		} catch (error) {
+			persistenceError = error;
+			persistenceFailed = true;
 		}
 		this.#setState({ status: "closing" });
 		this.#tearDown({ type: "shutdown" });
@@ -488,6 +667,7 @@ export class DurableChannelClient<
 				// Whatever the loop saw was already reported through the connection state.
 			}
 		}
+		if (persistenceFailed) throw persistenceError;
 	}
 
 	/**
@@ -496,8 +676,13 @@ export class DurableChannelClient<
 	 * otherwise carry a subscription set the hub does not share.
 	 */
 	async hello(args?: { readonly subscriptions?: readonly string[] }): Promise<DurableChannelHelloResult> {
+		await this.ready();
 		this.#assertOpen();
+		if (this.#initialized && this.#storage !== undefined && !this.#handshakeReady) {
+			throw new Error("A restored client must reconnect before calling hello");
+		}
 		this.#handshakeReady = false;
+		this.#checkpointWritable = false;
 		this.#handshakeMessages = [];
 		const subscriptions = [...(args?.subscriptions ?? [])];
 		const created: string[] = [];
@@ -550,10 +735,12 @@ export class DurableChannelClient<
 	 * subscription iterators end, which is how a peer learns to forget it.
 	 */
 	async reconnect(transport?: DurableChannelTransport): Promise<DurableChannelReconnectResult> {
+		await this.ready();
 		if (this.#done) {
 			throw new ClientClosedError();
 		}
 		this.#handshakeReady = false;
+		this.#checkpointWritable = false;
 		this.#handshakeMessages = [];
 		if (transport !== undefined) {
 			this.#attach(transport);
@@ -588,6 +775,7 @@ export class DurableChannelClient<
 				this.#restate(mirror);
 			}
 			for (const entry of this.#pendingEntries) entry.settle({ status: "lost" });
+			this.#persist();
 			return result;
 		}
 		const resumed = new Set(result.snapshots.map((snapshot) => snapshot.resource));
@@ -612,6 +800,7 @@ export class DurableChannelClient<
 		}
 		this.#finishHandshake();
 		for (const entry of this.#pendingEntries) entry.settle({ status: "lost" });
+		this.#persist();
 		return result;
 	}
 
@@ -620,6 +809,7 @@ export class DurableChannelClient<
 	 * attached before the request goes out, so nothing that arrives during the round trip is missed.
 	 */
 	async subscribe(uri: string): Promise<DurableChannelSubscribeHandle> {
+		await this.ready();
 		this.#assertOpen();
 		const known = this.#mirrors.has(uri);
 		const mirror = this.#mirrors.get(uri) ?? this.#mirror(uri);
@@ -635,6 +825,7 @@ export class DurableChannelClient<
 			} else {
 				this.#primeWithoutSnapshot(uri);
 			}
+			this.#persist();
 			return { snapshot: result.snapshot, subscription };
 		} catch (error) {
 			await subscription.close();
@@ -659,16 +850,18 @@ export class DurableChannelClient<
 	}
 
 	/** Drops a subscription: tells the hub, forgets the mirror, ends the iterators, loses the pending. */
-	unsubscribe(uri: string): Promise<void> {
+	async unsubscribe(uri: string): Promise<void> {
+		await this.ready();
 		if (this.#state.status !== "connected") {
 			this.#subscribed.delete(uri);
 			this.#forget(uri);
-			return Promise.resolve();
+			this.#persist();
+			return;
 		}
 		this.#subscribed.delete(uri);
 		this.#notify("unsubscribe", { channel: uri });
 		this.#forget(uri);
-		return Promise.resolve();
+		this.#persist();
 	}
 
 	/**
@@ -729,6 +922,7 @@ export class DurableChannelClient<
 				}
 				entry.settled = true;
 				this.#pendingEntries.delete(entry);
+				this.#persist();
 				resolve(outcome);
 			},
 		};
@@ -738,6 +932,7 @@ export class DurableChannelClient<
 			mirror.pending.push(entry);
 			this.#restate(mirror);
 		}
+		this.#persist();
 		this.#request("dispatch", { channel: uri, clientSeq, name, payload }).then(
 			(result) => this.#answered(uri, entry, result),
 			(error: DurableChannelClientError) => {
@@ -883,6 +1078,7 @@ export class DurableChannelClient<
 	 * `force`, which a snapshot needs because it restates the channel whether the value differs or not.
 	 */
 	#restate(mirror: Mirror<TEnv, TPrincipal>, force = false): void {
+		this.#persist();
 		if (!mirror.stateful) {
 			return;
 		}
@@ -1044,7 +1240,12 @@ export class DurableChannelClient<
 			this.#subscribed.clear();
 			this.#handshakeMessages = [];
 			this.#principal = undefined;
-			await this.shutdown();
+			await this.#persistQueue;
+			try {
+				await this.#storage?.clear();
+			} finally {
+				await this.shutdown();
+			}
 			throw error;
 		}
 		this.#principal = principal === undefined ? undefined : Object.freeze({ id: principal.id });
@@ -1053,9 +1254,11 @@ export class DurableChannelClient<
 
 	#finishHandshake(): void {
 		this.#handshakeReady = true;
+		this.#checkpointWritable = true;
 		const messages = this.#handshakeMessages;
 		this.#handshakeMessages = [];
 		for (const message of messages) this.#message(message);
+		this.#persist();
 	}
 
 	#message(message: DurableChannelMessage): void {
@@ -1124,7 +1327,9 @@ export class DurableChannelClient<
 		request.resolve(frame.result);
 	}
 
-	#request(method: string, params: Record<string, unknown>): Promise<unknown> {
+	async #request(method: string, params: Record<string, unknown>): Promise<unknown> {
+		await this.ready();
+		if (method === "dispatch") await this.flushPersistence();
 		this.#assertOpen();
 		const id = this.#nextRequestId;
 		this.#nextRequestId += 1;

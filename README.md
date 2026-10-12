@@ -666,6 +666,48 @@ for await (const event of subscription) {
 | `ping()` / `shutdown()`                                   | `Promise<void>`                                 | `ping` works before `hello`; `shutdown` is final                                |
 | `of(template)`                                            | a typed handle                                  | `.state({ id })`, `.dispatch({ id }, …)`, `.exec`, `.subscribe`, like the hub's |
 
+### Persisting client state in IndexedDB
+
+Pass an `IndexedDBClientStorage` to retain client state across page refreshes and tab closes. Reuse the same key when reopening that
+logical client, and await `ready()` before reading its saved state:
+
+```ts
+import { DurableChannelClient, IndexedDBClientStorage, WebSocketTransport } from "durable-channel";
+
+const storage = new IndexedDBClientStorage("my-app/main-client");
+const transport = await WebSocketTransport.connect("ws://127.0.0.1:8000/rpc");
+const client = new DurableChannelClient(routes, transport, {
+	storage,
+	onPersistenceError: (error) => console.error("Could not save client state", error),
+});
+const restored = await client.ready();
+client.connect();
+if (restored) {
+	await client.reconnect();
+} else {
+	await client.hello({ subscriptions: ["game:/42"] });
+}
+```
+
+Changes save automatically in atomic checkpoints containing the client ID, public principal ID, next client sequence, last server
+sequence, subscribed channels, confirmed states and their pending actions. Restoration rebuilds optimistic state with the same reducers.
+A reconnect then reconciles against server replay or fresh snapshots; pending actions are never automatically resent. Promises and event
+iterators belong to the old instance and are not restored. Attach new iterators with `attachSubscription(uri)`.
+
+`await client.flushPersistence()` waits for queued writes and retries a failed save. With persistence enabled, dispatch waits for its
+checkpoint to commit before sending the action; a failed save settles that dispatch as `lost`. `shutdown()` saves the current checkpoint
+before ending the in-memory client and its streams. Saves happen during normal use, so no unload handler is required. An abrupt close
+can interrupt an unfinished write; the next client resumes from the last committed checkpoint.
+
+Use a separate key for each independent client, account, and hub. Only one live client may write a given key at a time; concurrent tabs
+must use distinct keys and client IDs. A restored checkpoint requires `reconnect()` before dispatch. The server still authenticates the
+connection, and a changed principal clears the checkpoint and closes the client with `IdentityChangedError`.
+
+`IndexedDBClientStorage` accepts `{ databaseName }` to choose its database (default `durable-channel-clients`), and `storage.clear()`
+deletes just that key. After shutting down the client, clear its checkpoint to forget it, such as on logout. Invalid checkpoints, schema
+mismatches, and unavailable IndexedDB reject `ready()`; clear an obsolete checkpoint and create a fresh client. Persistence is opt-in,
+and applications can implement the exported `DurableChannelClientStorage` interface for another checkpoint backend.
+
 ### Reconciliation
 
 Per subscribed channel the client keeps three things: `confirmed`, the last state the hub agreed to; `pending`, the actions it has
@@ -883,8 +925,8 @@ rather than about a channel:
 
 ## Limitations
 
-- A client drives **one** transport at a time, and one hub. There is no multi-hub client, no retry or back-off policy, and no persisted
-  client state: a fresh client starts from a `hello`, and only the same client instance can `reconnect` from what it has already seen.
+- A client drives **one** transport at a time, and one hub. There is no multi-hub client and no retry or back-off policy. Without optional
+  client storage, a fresh client starts from `hello`; a client restored from storage can `reconnect` from its saved checkpoint.
   Several tabs of the same application are several clients, each with its own `clientId`; sharing one link between them is out of scope.
 - A client's `lastSeenServerSeq` is one number over every channel, as the hub's `serverSeq` is. A client that somehow misses an envelope but
   applies a later one claims to have seen both, and only a fresh `subscribe` will restate that channel.
