@@ -6,15 +6,19 @@
  * one, and the point of every test is that the client lands on the same state the hub holds — before
  * the round trip when it can, and after the server has spoken when the two disagree.
  */
-import { describe, it } from "node:test";
-import { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
-import * as v from "valibot";
+
+import { deepStrictEqual, ok, rejects, throws } from "node:assert/strict";
+import { upgradeWebSocket } from "@hono/node-server";
 import { Hono } from "hono";
+import * as v from "valibot";
+import { describe, it } from "vitest";
+import type { WebSocket } from "ws";
+import { serveApp } from "../test/server.ts";
 import { durableChannel } from "./channel.ts";
-import { durableRoutes } from "./routes.ts";
-import { type DurableChannelConnection, DurableChannelHub } from "./hub.ts";
-import { MemoryStorage } from "./storage.ts";
+import { DurableChannelClient, type DurableChannelClientEvent, type DurableChannelSubscription } from "./client.ts";
 import { ChannelNotFoundError, NotClientDispatchableError, RejectAction, RpcError, UnknownActionError } from "./error.ts";
+import { type DurableChannelConnection, DurableChannelHub } from "./hub.ts";
+import { durableRoutes } from "./routes.ts";
 import {
 	attachSocket,
 	createRpc,
@@ -23,8 +27,8 @@ import {
 	type DurableChannelSocketSession,
 	toRpcNotification,
 } from "./rpc.ts";
+import { MemoryStorage } from "./storage.ts";
 import { InMemoryTransport, WebSocketTransport } from "./transport.ts";
-import { DurableChannelClient, type DurableChannelClientEvent, type DurableChannelSubscription } from "./client.ts";
 
 type Env = { now(): string };
 
@@ -35,7 +39,16 @@ const GameState = v.object({
 	winner: v.optional(v.nullable(v.picklist(["X", "O", "draw"])), null),
 });
 
-const LINES = [[0, 1, 2], [3, 4, 5], [6, 7, 8], [0, 3, 6], [1, 4, 7], [2, 5, 8], [0, 4, 8], [2, 4, 6]];
+const LINES = [
+	[0, 1, 2],
+	[3, 4, 5],
+	[6, 7, 8],
+	[0, 3, 6],
+	[1, 4, 7],
+	[2, 5, 8],
+	[0, 4, 8],
+	[2, 4, 6],
+];
 
 function emptyBoard(): (null | "X" | "O")[] {
 	return [null, null, null, null, null, null, null, null, null];
@@ -54,7 +67,8 @@ const game = durableChannel()
 	.env<Env>()
 	.state(GameState, { board: emptyBoard(), next: "X" })
 	.action((a) =>
-		a.name("game/moved")
+		a
+			.name("game/moved")
 			.payload(v.object({ cell: v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(8)), player: Mark }))
 			.client()
 			.reduce((state, payload) => {
@@ -70,18 +84,24 @@ const game = durableChannel()
 				const board = [...state.board];
 				board[payload.cell] = payload.player;
 				return { board, next: payload.player === "X" ? "O" : "X", winner: winnerOf(board) };
-			})
+			}),
 	)
-	.action((a) => a.name("game/cleared").payload(v.object({})).reduce(() => ({ board: emptyBoard(), next: "X" as const, winner: null })))
+	.action((a) =>
+		a
+			.name("game/cleared")
+			.payload(v.object({}))
+			.reduce(() => ({ board: emptyBoard(), next: "X" as const, winner: null })),
+	)
 	.command((c) =>
-		c.name("reset")
+		c
+			.name("reset")
 			.params(v.object({}))
 			.result(v.object({ at: v.string() }))
 			.handler(async (_params, ctx) => {
 				await ctx.dispatch(ctx.uri, "game/cleared", {});
 				await ctx.notify(ctx.uri, "game/chat", { text: "new game" });
 				return { at: ctx.env.now() };
-			})
+			}),
 	)
 	.notification((n) => n.name("game/chat").payload(v.object({ text: v.string() })))
 	.build();
@@ -90,13 +110,15 @@ const room = durableChannel()
 	.env<Env>()
 	.state(v.object({ messages: v.array(v.object({ author: v.string(), text: v.string() })) }), { messages: [] })
 	.action((a) =>
-		a.name("room/said")
+		a
+			.name("room/said")
 			.payload(v.object({ author: v.string(), text: v.pipe(v.string(), v.minLength(1)) }))
 			.client()
-			.reduce((state, payload) => ({ messages: [...state.messages, payload] }))
+			.reduce((state, payload) => ({ messages: [...state.messages, payload] })),
 	)
 	.action((a) =>
-		a.name("log/messagePosted")
+		a
+			.name("log/messagePosted")
 			.payload(v.object({ author: v.string(), text: v.string(), clientSeq: v.number() }))
 			.client()
 			.reduce((state, payload, meta) => {
@@ -104,28 +126,35 @@ const room = durableChannel()
 					throw new RejectAction("origin must match the author and sequence");
 				}
 				return { messages: [...state.messages, { author: payload.author, text: payload.text }] };
-			})
+			}),
 	)
 	.action((a) =>
-		a.name("room/systemSaid")
+		a
+			.name("room/systemSaid")
 			.payload(v.object({ text: v.string() }))
 			.reduce((state, payload, meta) => {
 				if (meta.origin !== undefined) {
 					throw new RejectAction("system messages must have no origin");
 				}
 				return { messages: [...state.messages, { author: "system", text: payload.text }] };
-			})
+			}),
 	)
-	.action((a) => a.name("room/cleared").payload(v.object({})).reduce(() => ({ messages: [] })))
+	.action((a) =>
+		a
+			.name("room/cleared")
+			.payload(v.object({}))
+			.reduce(() => ({ messages: [] })),
+	)
 	.command((c) =>
-		c.name("clear")
+		c
+			.name("clear")
 			.params(v.object({}))
 			.result(v.number())
 			.handler(async (_params, ctx) => {
 				const before = (await ctx.state()).messages.length;
 				await ctx.dispatch(ctx.uri, "room/cleared", {});
 				return before;
-			})
+			}),
 	)
 	.build();
 
@@ -156,7 +185,7 @@ async function until(what: string, predicate: () => boolean, ms = 5000): Promise
 async function nextState(subscription: DurableChannelSubscription, what: string): Promise<unknown> {
 	while (true) {
 		const step = await withTimeout(subscription.next(), what);
-		assert(step.done !== true, `${what}: the subscription ended`);
+		ok(step.done !== true, `${what}: the subscription ended`);
 		if (step.value.type === "state") {
 			return step.value.state;
 		}
@@ -329,25 +358,25 @@ describe("DurableChannelClient", () => {
 			const bob = await host.open("bob", ["room:/lobby"]);
 			const accepted = client.dispatch("room:/lobby", "log/messagePosted", { author: "alice", text: "hello", clientSeq: 1 });
 			const expected = { messages: [{ author: "alice", text: "hello" }] };
-			assertEquals(client.state("room:/lobby"), expected);
-			assertEquals(client.confirmed("room:/lobby"), { messages: [] });
-			assertEquals((await withTimeout(accepted.settled, "the authorized echo")).status, "confirmed");
+			deepStrictEqual(client.state("room:/lobby"), expected);
+			deepStrictEqual(client.confirmed("room:/lobby"), { messages: [] });
+			deepStrictEqual((await withTimeout(accepted.settled, "the authorized echo")).status, "confirmed");
 			await until("bob to apply alice's origin", () => bob.client.confirmed("room:/lobby").messages.length === 1);
-			assertEquals(bob.client.state("room:/lobby"), expected);
-			assertEquals(client.confirmed("room:/lobby"), expected);
+			deepStrictEqual(bob.client.state("room:/lobby"), expected);
+			deepStrictEqual(client.confirmed("room:/lobby"), expected);
 			const rejected = client.dispatch("room:/lobby", "log/messagePosted", { author: "bob", text: "forged", clientSeq: 2 });
-			assertEquals(client.state("room:/lobby"), expected);
+			deepStrictEqual(client.state("room:/lobby"), expected);
 			const outcome = await withTimeout(rejected.settled, "the rejected echo");
-			assert(outcome.status === "rejected");
-			assertEquals(outcome.envelope.origin, { clientId: "alice", clientSeq: 2 });
-			assertEquals(await host.hub.get("room:/lobby"), expected);
-			assertEquals(client.pending("room:/lobby"), []);
+			ok(outcome.status === "rejected");
+			deepStrictEqual(outcome.envelope.origin, { clientId: "alice", clientSeq: 2 });
+			deepStrictEqual(await host.hub.get("room:/lobby"), expected);
+			deepStrictEqual(client.pending("room:/lobby"), []);
 			await host.hub.dispatch("room:/lobby", "room/systemSaid", { text: "notice" });
 			await until(
 				"both clients to apply the server origin",
 				() => client.confirmed("room:/lobby").messages.length === 2 && bob.client.confirmed("room:/lobby").messages.length === 2,
 			);
-			assertEquals(client.state("room:/lobby"), await host.hub.get("room:/lobby"));
+			deepStrictEqual(client.state("room:/lobby"), await host.hub.get("room:/lobby"));
 		} finally {
 			await host.stop();
 		}
@@ -361,22 +390,30 @@ describe("DurableChannelClient", () => {
 			link.mute();
 			const first = client.dispatch("room:/lobby", "log/messagePosted", { author: "alice", text: "first", clientSeq: 1 });
 			const second = client.dispatch("room:/lobby", "log/messagePosted", { author: "alice", text: "second", clientSeq: 2 });
-			const expected = { messages: [{ author: "alice", text: "first" }, { author: "alice", text: "second" }] };
-			assertEquals(client.state("room:/lobby"), expected);
+			const expected = {
+				messages: [
+					{ author: "alice", text: "first" },
+					{ author: "alice", text: "second" },
+				],
+			};
+			deepStrictEqual(client.state("room:/lobby"), expected);
 			await until("both actions to commit", () => host.hub.serverSeq === 2);
 			link.close();
 			await until("the transport to close", () => client.connectionState.status === "closed");
 			const resumed = await withTimeout(client.reconnect(host.serve().transport), "the origin replay");
-			assert(resumed.type === "replay");
-			assertEquals(resumed.actions.map((envelope) => envelope.origin), [
-				{ clientId: "alice", clientSeq: 1 },
-				{ clientId: "alice", clientSeq: 2 },
-			]);
-			assertEquals((await withTimeout(first.settled, "first replay")).status, "confirmed");
-			assertEquals((await withTimeout(second.settled, "second replay")).status, "confirmed");
-			assertEquals(client.confirmed("room:/lobby"), expected);
-			assertEquals(client.state("room:/lobby"), await host.hub.get("room:/lobby"));
-			assertEquals(client.pending("room:/lobby"), []);
+			ok(resumed.type === "replay");
+			deepStrictEqual(
+				resumed.actions.map((envelope) => envelope.origin),
+				[
+					{ clientId: "alice", clientSeq: 1 },
+					{ clientId: "alice", clientSeq: 2 },
+				],
+			);
+			deepStrictEqual((await withTimeout(first.settled, "first replay")).status, "confirmed");
+			deepStrictEqual((await withTimeout(second.settled, "second replay")).status, "confirmed");
+			deepStrictEqual(client.confirmed("room:/lobby"), expected);
+			deepStrictEqual(client.state("room:/lobby"), await host.hub.get("room:/lobby"));
+			deepStrictEqual(client.pending("room:/lobby"), []);
 		} finally {
 			await host.stop();
 		}
@@ -389,12 +426,15 @@ describe("DurableChannelClient", () => {
 			await host.newRoom("lobby");
 			const { client } = await host.open("alice");
 			const hello = await withTimeout(client.hello({ subscriptions: ["game:/1", "room:/lobby"] }), "the handshake");
-			assertEquals(hello.serverSeq, 0);
-			assertEquals(hello.snapshots.map((snapshot) => snapshot.resource), ["game:/1", "room:/lobby"]);
-			assertEquals(client.state("game:/1"), { board: emptyBoard(), next: "X", winner: null });
-			assertEquals(client.state("room:/lobby"), { messages: [] });
-			assertEquals(client.subscriptions, ["game:/1", "room:/lobby"]);
-			assertEquals(client.clientId, "alice");
+			deepStrictEqual(hello.serverSeq, 0);
+			deepStrictEqual(
+				hello.snapshots.map((snapshot) => snapshot.resource),
+				["game:/1", "room:/lobby"],
+			);
+			deepStrictEqual(client.state("game:/1"), { board: emptyBoard(), next: "X", winner: null });
+			deepStrictEqual(client.state("room:/lobby"), { messages: [] });
+			deepStrictEqual(client.subscriptions, ["game:/1", "room:/lobby"]);
+			deepStrictEqual(client.clientId, "alice");
 		} finally {
 			await host.stop();
 		}
@@ -407,18 +447,18 @@ describe("DurableChannelClient", () => {
 			const { client } = await host.open("alice", ["game:/1"]);
 			const watcher = collect(client.attachSubscription("game:/1"));
 			const handle = client.dispatch("game:/1", "game/moved", { cell: 4, player: "X" });
-			assertEquals(handle.clientSeq, 1);
-			assertEquals(client.state("game:/1").board[4], "X");
-			assertEquals(client.state("game:/1").next, "O");
-			assertEquals(client.confirmed("game:/1").board[4], null);
-			assertEquals(client.pending("game:/1"), [{ clientSeq: 1, name: "game/moved", payload: { cell: 4, player: "X" } }]);
+			deepStrictEqual(handle.clientSeq, 1);
+			deepStrictEqual(client.state("game:/1").board[4], "X");
+			deepStrictEqual(client.state("game:/1").next, "O");
+			deepStrictEqual(client.confirmed("game:/1").board[4], null);
+			deepStrictEqual(client.pending("game:/1"), [{ clientSeq: 1, name: "game/moved", payload: { cell: 4, player: "X" } }]);
 			const outcome = await withTimeout(handle.settled, "the echo of the move");
-			assertEquals(outcome.status, "confirmed");
-			assertEquals(client.confirmed("game:/1").board[4], "X");
-			assertEquals(client.state("game:/1"), client.confirmed("game:/1"));
-			assertEquals(client.pending("game:/1"), []);
-			assertEquals(watcher.kinds(), ["state", "action", "state"]);
-			assertEquals(await host.hub.get("game:/1"), client.confirmed("game:/1"));
+			deepStrictEqual(outcome.status, "confirmed");
+			deepStrictEqual(client.confirmed("game:/1").board[4], "X");
+			deepStrictEqual(client.state("game:/1"), client.confirmed("game:/1"));
+			deepStrictEqual(client.pending("game:/1"), []);
+			deepStrictEqual(watcher.kinds(), ["state", "action", "state"]);
+			deepStrictEqual(await host.hub.get("game:/1"), client.confirmed("game:/1"));
 		} finally {
 			await host.stop();
 		}
@@ -432,11 +472,11 @@ describe("DurableChannelClient", () => {
 			const bob = await host.open("bob", ["game:/1"]);
 			const watching = bob.client.attachSubscription("game:/1");
 			await withTimeout(alice.client.dispatch("game:/1", "game/moved", { cell: 0, player: "X" }).settled, "alice's move");
-			assertEquals(await nextState(watching, "bob to see alice's move"), alice.client.confirmed("game:/1"));
+			deepStrictEqual(await nextState(watching, "bob to see alice's move"), alice.client.confirmed("game:/1"));
 			await withTimeout(bob.client.dispatch("game:/1", "game/moved", { cell: 4, player: "O" }).settled, "bob's move");
 			await until("alice to see bob's move", () => alice.client.confirmed("game:/1").board[4] === "O");
-			assertEquals(alice.client.state("game:/1"), bob.client.state("game:/1"));
-			assertEquals(await host.hub.get("game:/1"), alice.client.state("game:/1"));
+			deepStrictEqual(alice.client.state("game:/1"), bob.client.state("game:/1"));
+			deepStrictEqual(await host.hub.get("game:/1"), alice.client.state("game:/1"));
 			await watching.close();
 		} finally {
 			await host.stop();
@@ -451,14 +491,14 @@ describe("DurableChannelClient", () => {
 			await withTimeout(client.dispatch("game:/1", "game/moved", { cell: 0, player: "X" }).settled, "the first move");
 			const before = client.state("game:/1");
 			const handle = client.dispatch("game:/1", "game/moved", { cell: 0, player: "O" });
-			assertEquals(client.state("game:/1"), before);
+			deepStrictEqual(client.state("game:/1"), before);
 			const outcome = await withTimeout(handle.settled, "the refusal");
-			assertEquals(outcome.status, "rejected");
-			assert(outcome.status === "rejected");
-			assertEquals(outcome.reason, "cell 0 is taken");
-			assertEquals(client.state("game:/1"), client.confirmed("game:/1"));
-			assertEquals(client.pending("game:/1"), []);
-			assertEquals(await host.hub.get("game:/1"), client.confirmed("game:/1"));
+			deepStrictEqual(outcome.status, "rejected");
+			ok(outcome.status === "rejected");
+			deepStrictEqual(outcome.reason, "cell 0 is taken");
+			deepStrictEqual(client.state("game:/1"), client.confirmed("game:/1"));
+			deepStrictEqual(client.pending("game:/1"), []);
+			deepStrictEqual(await host.hub.get("game:/1"), client.confirmed("game:/1"));
 		} finally {
 			await host.stop();
 		}
@@ -475,19 +515,19 @@ describe("DurableChannelClient", () => {
 			bob.link.deafen();
 			await withTimeout(alice.client.dispatch("game:/1", "game/moved", { cell: 4, player: "X" }).settled, "alice's move");
 			const handle = bob.client.dispatch("game:/1", "game/moved", { cell: 4, player: "X" });
-			assertEquals(bob.client.state("game:/1").board[4], "X");
-			assertEquals(bob.client.confirmed("game:/1").board[4], null);
+			deepStrictEqual(bob.client.state("game:/1").board[4], "X");
+			deepStrictEqual(bob.client.confirmed("game:/1").board[4], null);
 			const outcome = await withTimeout(handle.settled, "bob's refusal");
-			assert(outcome.status === "rejected");
-			assertEquals(outcome.reason, "cell 4 is taken");
-			assertEquals(bob.client.state("game:/1").board[4], null);
-			assertEquals(bob.client.state("game:/1"), bob.client.confirmed("game:/1"));
+			ok(outcome.status === "rejected");
+			deepStrictEqual(outcome.reason, "cell 4 is taken");
+			deepStrictEqual(bob.client.state("game:/1").board[4], null);
+			deepStrictEqual(bob.client.state("game:/1"), bob.client.confirmed("game:/1"));
 			// Bob's confirmed state is behind, and a reconnect cannot tell: he applied a later sequence
 			// than the one he missed, so he claims to have seen it. Re-subscribing is what fixes that.
 			bob.link.hear();
 			await bob.client.unsubscribe("game:/1");
 			await withTimeout(bob.client.subscribe("game:/1"), "bob's fresh subscription");
-			assertEquals(bob.client.state("game:/1"), await host.hub.get("game:/1"));
+			deepStrictEqual(bob.client.state("game:/1"), await host.hub.get("game:/1"));
 		} finally {
 			await host.stop();
 		}
@@ -498,11 +538,11 @@ describe("DurableChannelClient", () => {
 		try {
 			await host.newGame("1");
 			const { client } = await host.open("alice", ["game:/1"]);
-			assertThrows(() => client.dispatch("game:/1", "game/cleared", {}), NotClientDispatchableError);
-			assertThrows(() => client.dispatch("game:/1", "game/ghost", {}), UnknownActionError);
-			assertThrows(() => client.dispatch("game:/1", "game/moved", { cell: 99, player: "X" }), Error);
-			assertEquals(host.hub.serverSeq, 0);
-			assertEquals(client.pending("game:/1"), []);
+			throws(() => client.dispatch("game:/1", "game/cleared", {}), NotClientDispatchableError);
+			throws(() => client.dispatch("game:/1", "game/ghost", {}), UnknownActionError);
+			throws(() => client.dispatch("game:/1", "game/moved", { cell: 99, player: "X" }), Error);
+			deepStrictEqual(host.hub.serverSeq, 0);
+			deepStrictEqual(client.pending("game:/1"), []);
 		} finally {
 			await host.stop();
 		}
@@ -513,14 +553,14 @@ describe("DurableChannelClient", () => {
 		try {
 			await host.newGame("1");
 			const { client, link } = await host.open("alice", ["game:/1"]);
-			assert(link.connection);
+			ok(link.connection);
 			await host.hub.dispatchFrom(link.connection, "game:/1", "game/moved", { cell: 0, player: "X" }, 9);
 			await until("the client to see the move", () => client.confirmed("game:/1").board[0] === "X");
 			const handle = client.dispatch("game:/1", "game/moved", { cell: 1, player: "O" });
-			assertEquals(client.state("game:/1").board[1], "O");
-			assertEquals(await withTimeout(handle.settled, "the duplicate verdict"), { status: "duplicate" });
-			assertEquals(client.state("game:/1").board[1], null);
-			assertEquals(client.pending("game:/1"), []);
+			deepStrictEqual(client.state("game:/1").board[1], "O");
+			deepStrictEqual(await withTimeout(handle.settled, "the duplicate verdict"), { status: "duplicate" });
+			deepStrictEqual(client.state("game:/1").board[1], null);
+			deepStrictEqual(client.pending("game:/1"), []);
 		} finally {
 			await host.stop();
 		}
@@ -534,14 +574,14 @@ describe("DurableChannelClient", () => {
 			await withTimeout(client.dispatch("game:/1", "game/moved", { cell: 0, player: "X" }).settled, "the first move");
 			const watching = client.attachSubscription("game:/1");
 			const result = await withTimeout(client.exec("game:/1", "reset", {}), "the reset");
-			assertEquals(result, { at: "2026-09-07T00:00:00.000Z" });
+			deepStrictEqual(result, { at: "2026-09-07T00:00:00.000Z" });
 			const step = await withTimeout(watching.next(), "the reset action");
-			assert(step.done !== true && step.value.type === "action");
-			assertEquals(step.value.envelope.name, "game/cleared");
-			assertEquals(step.value.envelope.origin, undefined);
+			ok(step.done !== true && step.value.type === "action");
+			deepStrictEqual(step.value.envelope.name, "game/cleared");
+			deepStrictEqual(step.value.envelope.origin, undefined);
 			await until("the cleared board", () => client.state("game:/1").board[0] === null);
 			await watching.close();
-			await assertRejects(() => client.exec("game:/1", "ghost", {}), RpcError);
+			await rejects(() => client.exec("game:/1", "ghost", {}), RpcError);
 		} finally {
 			await host.stop();
 		}
@@ -558,8 +598,8 @@ describe("DurableChannelClient", () => {
 			const missed = collect(bob.client.attachSubscription("game:/2"));
 			await host.hub.notify("game:/1", "game/chat", { text: "good luck" });
 			await until("alice to hear the chat", () => heard.events.length === 1);
-			assertEquals(heard.events, [{ type: "notification", channel: "game:/1", name: "game/chat", payload: { text: "good luck" } }]);
-			assertEquals(missed.events, []);
+			deepStrictEqual(heard.events, [{ type: "notification", channel: "game:/1", name: "game/chat", payload: { text: "good luck" } }]);
+			deepStrictEqual(missed.events, []);
 		} finally {
 			await host.stop();
 		}
@@ -572,16 +612,16 @@ describe("DurableChannelClient", () => {
 			const { client } = await host.open("alice", ["room:/lobby"]);
 			const watching = client.attachSubscription("room:/lobby");
 			const said = client.dispatch("room:/lobby", "room/said", { author: "alice", text: "hello" });
-			assertEquals(client.state("room:/lobby"), { messages: [{ author: "alice", text: "hello" }] });
+			deepStrictEqual(client.state("room:/lobby"), { messages: [{ author: "alice", text: "hello" }] });
 			await withTimeout(said.settled, "the message");
-			assertEquals(await withTimeout(client.exec("room:/lobby", "clear", {}), "the clear"), 1);
+			deepStrictEqual(await withTimeout(client.exec("room:/lobby", "clear", {}), "the clear"), 1);
 			await until("the cleared room", () => client.state("room:/lobby").messages.length === 0);
 			await client.unsubscribe("room:/lobby");
 			await endOf(watching, "the end of the subscription");
-			assertEquals(client.subscriptions, []);
-			assertThrows(() => client.state("room:/lobby"), ChannelNotFoundError);
+			deepStrictEqual(client.subscriptions, []);
+			throws(() => client.state("room:/lobby"), ChannelNotFoundError);
 			await host.hub.dispatch("room:/lobby", "room/said", { author: "bob", text: "anyone?" });
-			assertEquals((await host.hub.get("room:/lobby") as { messages: unknown[] }).messages.length, 1);
+			deepStrictEqual(((await host.hub.get("room:/lobby")) as { messages: unknown[] }).messages.length, 1);
 		} finally {
 			await host.stop();
 		}
@@ -598,17 +638,20 @@ describe("DurableChannelClient", () => {
 			await until("the hub to commit the move", () => host.hub.serverSeq === 1);
 			link.close();
 			await until("the client to notice the drop", () => client.connectionState.status === "closed");
-			assertEquals(client.pending("game:/1").length, 1);
+			deepStrictEqual(client.pending("game:/1").length, 1);
 			await host.hub.dispatch("game:/1", "game/cleared", {});
 			const next = host.serve();
 			const resumed = await withTimeout(client.reconnect(next.transport), "the reconnect");
-			assertEquals(resumed.type, "replay");
-			assert(resumed.type === "replay");
-			assertEquals(resumed.actions.map((envelope) => envelope.name), ["game/moved", "game/cleared"]);
-			assertEquals(await withTimeout(handle.settled, "the replayed outcome"), { status: "confirmed", envelope: resumed.actions[0] });
-			assertEquals(client.pending("game:/1"), []);
-			assertEquals(client.state("game:/1"), await host.hub.get("game:/1"));
-			assertEquals(client.lastSeenServerSeq, 2);
+			deepStrictEqual(resumed.type, "replay");
+			ok(resumed.type === "replay");
+			deepStrictEqual(
+				resumed.actions.map((envelope) => envelope.name),
+				["game/moved", "game/cleared"],
+			);
+			deepStrictEqual(await withTimeout(handle.settled, "the replayed outcome"), { status: "confirmed", envelope: resumed.actions[0] });
+			deepStrictEqual(client.pending("game:/1"), []);
+			deepStrictEqual(client.state("game:/1"), await host.hub.get("game:/1"));
+			deepStrictEqual(client.lastSeenServerSeq, 2);
 		} finally {
 			await host.stop();
 		}
@@ -628,10 +671,10 @@ describe("DurableChannelClient", () => {
 			await host.hub.dispatch("game:/1", "game/moved", { cell: 1, player: "X" });
 			const next = host.serve();
 			const resumed = await withTimeout(client.reconnect(next.transport), "the reconnect");
-			assertEquals(resumed.type, "snapshot");
-			assertEquals(await withTimeout(handle.settled, "the lost outcome"), { status: "lost" });
-			assertEquals(client.pending("game:/1"), []);
-			assertEquals(client.state("game:/1"), await host.hub.get("game:/1"));
+			deepStrictEqual(resumed.type, "snapshot");
+			deepStrictEqual(await withTimeout(handle.settled, "the lost outcome"), { status: "lost" });
+			deepStrictEqual(client.pending("game:/1"), []);
+			deepStrictEqual(client.state("game:/1"), await host.hub.get("game:/1"));
 		} finally {
 			await host.stop();
 		}
@@ -646,11 +689,11 @@ describe("DurableChannelClient", () => {
 			const watching = client.attachSubscription("room:/lobby");
 			await host.hub.destroy("room:/lobby");
 			const resumed = await withTimeout(client.reconnect(), "the reconnect");
-			assertEquals(resumed.missing, ["room:/lobby"]);
-			assertEquals(client.subscriptions, ["game:/1"]);
+			deepStrictEqual(resumed.missing, ["room:/lobby"]);
+			deepStrictEqual(client.subscriptions, ["game:/1"]);
 			await endOf(watching, "the end of the subscription");
-			assertThrows(() => client.state("room:/lobby"), ChannelNotFoundError);
-			assertEquals(client.state("game:/1"), await host.hub.get("game:/1"));
+			throws(() => client.state("room:/lobby"), ChannelNotFoundError);
+			deepStrictEqual(client.state("game:/1"), await host.hub.get("game:/1"));
 		} finally {
 			await host.stop();
 		}
@@ -662,12 +705,12 @@ describe("DurableChannelClient", () => {
 			await host.newGame("7");
 			const { client } = await host.open("alice", []);
 			const games = client.of("game:/:id");
-			assertEquals(games.uri({ id: "7" }), "game:/7");
+			deepStrictEqual(games.uri({ id: "7" }), "game:/7");
 			const { subscription } = await withTimeout(games.subscribe({ id: "7" }), "the subscription");
 			await withTimeout(games.dispatch({ id: "7" }, "game/moved", { cell: 8, player: "X" }).settled, "the move");
-			assertEquals(games.state({ id: "7" }).board[8], "X");
-			assertEquals(games.confirmed({ id: "7" }), await host.hub.get("game:/7"));
-			assertEquals(await withTimeout(games.exec({ id: "7" }, "reset", {}), "the reset"), { at: "2026-09-07T00:00:00.000Z" });
+			deepStrictEqual(games.state({ id: "7" }).board[8], "X");
+			deepStrictEqual(games.confirmed({ id: "7" }), await host.hub.get("game:/7"));
+			deepStrictEqual(await withTimeout(games.exec({ id: "7" }, "reset", {}), "the reset"), { at: "2026-09-07T00:00:00.000Z" });
 			await subscription.close();
 		} finally {
 			await host.stop();
@@ -689,7 +732,7 @@ describe("DurableChannelClient", () => {
 			await withTimeout(client.dispatch("game:/1", "game/moved", { cell: 0, player: "X" }).settled, "the move");
 			await host.hub.notify("game:/1", "game/chat", { text: "hi" });
 			await until("every event to arrive", () => seen.length === 4);
-			assertEquals(seen, ["game:/1 state", "game:/1 action", "game:/1 state", "game:/1 notification"]);
+			deepStrictEqual(seen, ["game:/1 state", "game:/1 action", "game:/1 state", "game:/1 notification"]);
 			await events.return?.();
 			await drained;
 		} finally {
@@ -706,11 +749,11 @@ describe("DurableChannelClient", () => {
 			const handle = client.dispatch("game:/1", "game/moved", { cell: 0, player: "X" });
 			const watching = client.attachSubscription("game:/1");
 			await withTimeout(client.shutdown(), "the shutdown");
-			assertEquals(await withTimeout(handle.settled, "the lost outcome"), { status: "lost" });
+			deepStrictEqual(await withTimeout(handle.settled, "the lost outcome"), { status: "lost" });
 			await endOf(watching, "the end of the subscription");
-			assertEquals(client.connectionState, { status: "closed", reason: { type: "shutdown" } });
-			assertThrows(() => client.dispatch("game:/1", "game/moved", { cell: 1, player: "O" }), Error);
-			await assertRejects(() => client.ping(), Error);
+			deepStrictEqual(client.connectionState, { status: "closed", reason: { type: "shutdown" } });
+			throws(() => client.dispatch("game:/1", "game/moved", { cell: 1, player: "O" }), Error);
+			await rejects(() => client.ping(), Error);
 		} finally {
 			await host.stop();
 		}
@@ -722,18 +765,17 @@ describe("DurableChannelClient over a WebSocket", () => {
 		const hub = new DurableChannelHub(routes, { storage: new MemoryStorage(), env: { now: () => "2026-09-07T00:00:00.000Z" } });
 		const rpc = createRpc(hub);
 		const sessions = new Set<DurableChannelSocketSession>();
-		const sockets = new Set<WebSocket>();
 		const app = new Hono();
-		app.get("/rpc", (context) => {
-			const { socket, response } = Deno.upgradeWebSocket(context.req.raw);
-			sockets.add(socket);
-			socket.addEventListener("close", () => sockets.delete(socket));
-			sessions.add(attachSocket(rpc, hub, socket));
-			return response;
-		});
-		const listener = Deno.serve({ port: 0, hostname: "127.0.0.1", onListen() {} }, app.fetch);
-		const { port } = listener.addr as Deno.NetAddr;
-		const transport = await withTimeout(WebSocketTransport.connect(`ws://127.0.0.1:${port}/rpc`), "the socket to open");
+		app.get(
+			"/rpc",
+			upgradeWebSocket(() => ({
+				onOpen(_event, socket) {
+					sessions.add(attachSocket(rpc, hub, socket.raw as WebSocket));
+				},
+			})),
+		);
+		const listener = await serveApp(app);
+		const transport = await withTimeout(WebSocketTransport.connect(listener.url("/rpc")), "the socket to open");
 		const client = new DurableChannelClient(routes, transport, { clientId: "alice", requestTimeoutMs: 5000 });
 		try {
 			await hub.of("game:/:id").create({ id: "1" });
@@ -742,25 +784,22 @@ describe("DurableChannelClient over a WebSocket", () => {
 			await withTimeout(client.hello({ subscriptions: ["game:/1"] }), "the handshake");
 			const watching = client.attachSubscription("game:/1");
 			const handle = client.dispatch("game:/1", "game/moved", { cell: 4, player: "X" });
-			assertEquals(client.state("game:/1").board[4], "X");
+			deepStrictEqual(client.state("game:/1").board[4], "X");
 			const outcome = await withTimeout(handle.settled, "the echo over the socket");
-			assertEquals(outcome.status, "confirmed");
-			assertEquals(client.confirmed("game:/1"), await hub.get("game:/1"));
-			assertEquals(await withTimeout(client.exec("game:/1", "reset", {}), "the reset"), { at: "2026-09-07T00:00:00.000Z" });
+			deepStrictEqual(outcome.status, "confirmed");
+			deepStrictEqual(client.confirmed("game:/1"), await hub.get("game:/1"));
+			deepStrictEqual(await withTimeout(client.exec("game:/1", "reset", {}), "the reset"), { at: "2026-09-07T00:00:00.000Z" });
 			await until("the cleared board", () => client.state("game:/1").board[4] === null);
 			const refused = await withTimeout(client.dispatch("game:/1", "game/moved", { cell: 0, player: "O" }).settled, "the refusal");
-			assertEquals(refused.status, "rejected");
+			deepStrictEqual(refused.status, "rejected");
 			await watching.close();
 		} finally {
 			await withTimeout(client.shutdown(), "the client to shut down");
 			for (const session of sessions) {
 				session.detach();
 			}
-			for (const socket of [...sockets]) {
-				socket.close(1000);
-			}
 			await withTimeout(hub.close(), "the hub to close");
-			await withTimeout(listener.shutdown(), "the listener to shut down");
+			await withTimeout(listener.stop(), "the listener to shut down");
 		}
 	});
 });

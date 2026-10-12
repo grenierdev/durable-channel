@@ -3,17 +3,12 @@
  *
  * This is the only file in the package allowed to know that AHP exists. It holds the whole adapter:
  * the root channel definition, the wire translation, the per-socket link, the hana collection whose
- * procedure names are the AHP methods, and a Hono + `Deno.serve` host. The library underneath it is
+ * procedure names are the AHP methods, and a Hono host on Node.js. The library underneath it is
  * protocol-agnostic.
  */
-import { describe, it } from "node:test";
-import { assert, assertEquals, assertInstanceOf, assertNotEquals } from "@std/assert";
-import * as v from "valibot";
-import { Hono } from "hono";
-import { upgradeWebSocket } from "hono/deno";
-import { Hana, hana, JsonRpcError } from "./hana.ts";
-import * as ahp from "@microsoft/agent-host-protocol";
-import { MessageKind, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from "@microsoft/agent-host-protocol";
+
+import { deepStrictEqual, notDeepStrictEqual, ok } from "node:assert/strict";
+import { upgradeWebSocket } from "@hono/node-server";
 import type {
 	ActionEnvelope,
 	ChatAction,
@@ -33,12 +28,17 @@ import type {
 	TurnState,
 	UsageInfo,
 } from "@microsoft/agent-host-protocol";
+import * as ahp from "@microsoft/agent-host-protocol";
+import { MessageKind, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from "@microsoft/agent-host-protocol";
 import { AhpClient, AhpStateMirror, type ClientEvent, RpcError, type Subscription } from "@microsoft/agent-host-protocol/client";
-import { WebSocketTransport } from "@microsoft/agent-host-protocol/ws";
 import { type HostClientHandle, immediateForeverPolicy, MultiHostClient } from "@microsoft/agent-host-protocol/hosts";
+import { WebSocketTransport } from "@microsoft/agent-host-protocol/ws";
+import { Hono } from "hono";
+import * as v from "valibot";
+import { describe, it } from "vitest";
+import { serveApp } from "../test/server.ts";
+import { Hana, hana, JsonRpcError } from "./hana.ts";
 import {
-	DenoKvStorage,
-	durableChannel,
 	type DurableChannelActionEffectContext,
 	type DurableChannelConnection,
 	DurableChannelError,
@@ -46,10 +46,12 @@ import {
 	type DurableChannelHubOptions,
 	type DurableChannelMessage,
 	type DurableChannelStorage,
+	durableChannel,
 	durableRoutes,
 	MemoryStorage,
 	RejectAction,
 } from "./mod.ts";
+import { SqliteStorage } from "./sqlite.ts";
 
 // ─── Channel definitions ─────────────────────────────────────────────────────
 
@@ -74,7 +76,7 @@ type Env = {
 	tick(): Promise<void>;
 };
 
-/** `SessionStatus`, whose `const enum` Deno cannot read as a value. Pinned against the runtime object. */
+/** `SessionStatus`, whose `const enum` cannot be read as a value under isolated transforms. Pinned against the runtime object. */
 const STATUS = { Idle: 1, Error: 2, InProgress: 8, InputNeeded: 24, IsRead: 32, IsArchived: 64 };
 
 /** The mutually-exclusive activity bits of a status; `IsRead` and `IsArchived` sit above them. */
@@ -161,19 +163,26 @@ const root = durableChannel()
 	.env<Env>()
 	.state(RootStateSchema, initialRootState)
 	.action((a) =>
-		a.name("root/agentsChanged").payload(v.object({ agents: v.array(AgentInfo) })).reduce((state, payload) => ({
-			...state,
-			agents: payload.agents,
-		}))
+		a
+			.name("root/agentsChanged")
+			.payload(v.object({ agents: v.array(AgentInfo) }))
+			.reduce((state, payload) => ({
+				...state,
+				agents: payload.agents,
+			})),
 	)
 	.action((a) =>
-		a.name("root/activeSessionsChanged").payload(v.object({ activeSessions: v.number() })).reduce((state, payload) => ({
-			...state,
-			activeSessions: payload.activeSessions,
-		}))
+		a
+			.name("root/activeSessionsChanged")
+			.payload(v.object({ activeSessions: v.number() }))
+			.reduce((state, payload) => ({
+				...state,
+				activeSessions: payload.activeSessions,
+			})),
 	)
 	.action((a) =>
-		a.name("root/configChanged")
+		a
+			.name("root/configChanged")
 			.payload(v.object({ config: v.record(v.string(), v.unknown()), replace: v.optional(v.boolean()) }))
 			.client()
 			.reduce((state, payload) => {
@@ -186,22 +195,25 @@ const root = durableChannel()
 					throw new RejectAction('config key "locked" is read-only');
 				}
 				return { ...state, config: { ...state.config, values } };
-			})
+			}),
 	)
 	.notification((n) => n.name("root/sessionAdded").payload(v.object({ summary: opaque<SessionSummary>() })))
 	.notification((n) => n.name("root/sessionRemoved").payload(v.object({ session: v.string() })))
 	.notification((n) =>
-		n.name("root/sessionSummaryChanged").payload(v.object({ session: v.string(), changes: opaque<Partial<SessionSummary>>() }))
+		n.name("root/sessionSummaryChanged").payload(v.object({ session: v.string(), changes: opaque<Partial<SessionSummary>>() })),
 	)
 	.command((c) =>
-		c.name("createSession")
-			.params(v.object({
-				session: v.string(),
-				provider: v.optional(v.string()),
-				workingDirectories: v.optional(v.array(v.string())),
-				config: v.optional(v.record(v.string(), v.unknown())),
-				activeClient: v.optional(opaque<SessionState["activeClients"][number]>()),
-			}))
+		c
+			.name("createSession")
+			.params(
+				v.object({
+					session: v.string(),
+					provider: v.optional(v.string()),
+					workingDirectories: v.optional(v.array(v.string())),
+					config: v.optional(v.record(v.string(), v.unknown())),
+					activeClient: v.optional(opaque<SessionState["activeClients"][number]>()),
+				}),
+			)
 			.result(v.null())
 			.handler(async (params, ctx) => {
 				const { agents } = await ctx.state();
@@ -222,18 +234,19 @@ const root = durableChannel()
 				});
 				await ctx.dispatch(X_CATALOG, "catalog/sessionAdded", { session: params.session, createdAt: at, modifiedAt: at });
 				await ctx.dispatch(AHP_ROOT, "root/activeSessionsChanged", { activeSessions: await countSessions(ctx) });
-				const state = await ctx.get(params.session) as SessionStateShape;
+				const state = (await ctx.get(params.session)) as SessionStateShape;
 				await ctx.notify(AHP_ROOT, "root/sessionAdded", { summary: summaryOf(params.session, state, { createdAt: at, modifiedAt: at }) });
 				await ctx.dispatch(params.session, "session/ready", {});
 				return null;
-			})
+			}),
 	)
 	.command((c) =>
-		c.name("listSessions")
+		c
+			.name("listSessions")
 			.params(v.object({ limit: v.optional(v.number()), cursor: v.optional(v.string()) }))
 			.result(v.object({ items: v.array(opaque<SessionSummary>()), nextCursor: v.optional(v.string()) }))
 			.handler(async (params, ctx) => {
-				const catalogue = await ctx.get(X_CATALOG) as CatalogueShape;
+				const catalogue = (await ctx.get(X_CATALOG)) as CatalogueShape;
 				const items: SessionSummary[] = [];
 				for await (const instance of ctx.list(AHP_SESSION_TEMPLATE)) {
 					items.push(summaryOf(instance.uri, instance.state as SessionStateShape, catalogue.sessions[instance.uri] ?? EPOCH));
@@ -253,7 +266,7 @@ const root = durableChannel()
 					items: page,
 					...(last !== undefined && from + page.length < items.length ? { nextCursor: last.resource } : {}),
 				};
-			})
+			}),
 	)
 	.build();
 
@@ -357,7 +370,7 @@ const ChatStateSchema = v.object({
 type ChatStateShape = v.InferOutput<typeof ChatStateSchema>;
 type ActiveTurnShape = v.InferOutput<typeof ActiveTurnSchema>;
 
-/** `TurnState`, one more `const enum` Deno cannot read as a value. Pinned against the runtime object. */
+/** `TurnState`, one more `const enum` an isolated transform cannot read as a value. Pinned against the runtime object. */
 const TURN = { Complete: "complete", Cancelled: "cancelled", Error: "error" } as Record<string, TurnState>;
 
 /** Only a placeholder: every chat instance is created with an explicit state by `createChat`. */
@@ -480,8 +493,10 @@ const _sessionStateIsAssignable: SessionState = initialSessionState;
 
 /** The chat a summary speaks for: the default one, or the most recently modified. */
 function primaryChat(state: SessionStateShape): v.InferOutput<typeof ChatSummarySchema> | undefined {
-	return state.chats.find((chat) => chat.resource === state.defaultChat) ??
-		[...state.chats].sort((left, right) => right.modifiedAt.localeCompare(left.modifiedAt))[0];
+	return (
+		state.chats.find((chat) => chat.resource === state.defaultChat) ??
+		[...state.chats].sort((left, right) => right.modifiedAt.localeCompare(left.modifiedAt))[0]
+	);
 }
 
 /**
@@ -496,10 +511,10 @@ function aggregateSessionStatus(state: SessionStateShape): number {
 	const activity = state.chats.some((chat) => (chat.status & ACTIVITY_MASK) === STATUS.InputNeeded)
 		? STATUS.InputNeeded
 		: state.chats.some((chat) => (chat.status & ACTIVITY_MASK) === STATUS.Error)
-		? STATUS.Error
-		: primary === undefined
-		? state.status & ACTIVITY_MASK
-		: primary.status & ACTIVITY_MASK;
+			? STATUS.Error
+			: primary === undefined
+				? state.status & ACTIVITY_MASK
+				: primary.status & ACTIVITY_MASK;
 	return flags | activity;
 }
 
@@ -518,7 +533,7 @@ function summaryOf(uri: string, state: SessionStateShape, times: { createdAt: st
 }
 
 async function countSessions(ctx: { get(uri: string): Promise<unknown> }): Promise<number> {
-	return Object.keys((await ctx.get(X_CATALOG) as CatalogueShape).sessions).length;
+	return Object.keys(((await ctx.get(X_CATALOG)) as CatalogueShape).sessions).length;
 }
 
 /**
@@ -532,11 +547,12 @@ function touched(
 	return async (ctx) => {
 		const modifiedAt = ctx.env.now();
 		await ctx.dispatch(X_CATALOG, "catalog/sessionTouched", { session: ctx.uri, modifiedAt });
-		const changed = field === "title"
-			? { title: ctx.state.title }
-			: field === "status"
-			? { status: aggregateSessionStatus(ctx.state) }
-			: { activity: ctx.state.activity };
+		const changed =
+			field === "title"
+				? { title: ctx.state.title }
+				: field === "status"
+					? { status: aggregateSessionStatus(ctx.state) }
+					: { activity: ctx.state.activity };
 		await ctx.notify(AHP_ROOT, "root/sessionSummaryChanged", { session: ctx.uri, changes: { ...changed, modifiedAt } });
 	};
 }
@@ -550,14 +566,21 @@ function touched(
 const session = durableChannel()
 	.env<Env>()
 	.state(SessionStateSchema, initialSessionState)
-	.action((a) => a.name("session/ready").payload(v.object({})).reduce((state) => ({ ...state, lifecycle: LIFECYCLE.Ready })))
 	.action((a) =>
-		a.name("session/creationFailed")
-			.payload(v.object({ error: opaque<NonNullable<SessionState["creationError"]>>() }))
-			.reduce((state, payload) => ({ ...state, lifecycle: LIFECYCLE.Failed, creationError: payload.error }))
+		a
+			.name("session/ready")
+			.payload(v.object({}))
+			.reduce((state) => ({ ...state, lifecycle: LIFECYCLE.Ready })),
 	)
 	.action((a) =>
-		a.name("session/chatAdded")
+		a
+			.name("session/creationFailed")
+			.payload(v.object({ error: opaque<NonNullable<SessionState["creationError"]>>() }))
+			.reduce((state, payload) => ({ ...state, lifecycle: LIFECYCLE.Failed, creationError: payload.error })),
+	)
+	.action((a) =>
+		a
+			.name("session/chatAdded")
 			.payload(v.object({ summary: ChatSummarySchema }))
 			.reduce((state, payload) => {
 				const at = state.chats.findIndex((chat) => chat.resource === payload.summary.resource);
@@ -568,10 +591,11 @@ const session = durableChannel()
 				chats[at] = payload.summary;
 				return { ...state, chats };
 			})
-			.effect(touched("status"))
+			.effect(touched("status")),
 	)
 	.action((a) =>
-		a.name("session/chatRemoved")
+		a
+			.name("session/chatRemoved")
 			.payload(v.object({ chat: v.string() }))
 			.reduce((state, payload) => {
 				const chats = state.chats.filter((chat) => chat.resource !== payload.chat);
@@ -584,10 +608,11 @@ const session = durableChannel()
 				}
 				return next;
 			})
-			.effect(touched("status"))
+			.effect(touched("status")),
 	)
 	.action((a) =>
-		a.name("session/chatUpdated")
+		a
+			.name("session/chatUpdated")
 			.payload(v.object({ chat: v.string(), changes: opaque<Partial<ChatSummary>>() }))
 			.reduce((state, payload) => {
 				const at = state.chats.findIndex((chat) => chat.resource === payload.chat);
@@ -602,10 +627,11 @@ const session = durableChannel()
 				chats[at] = { ...chats[at], ...prune(changes) };
 				return { ...state, chats };
 			})
-			.effect(touched("status"))
+			.effect(touched("status")),
 	)
 	.action((a) =>
-		a.name("session/defaultChatChanged")
+		a
+			.name("session/defaultChatChanged")
 			.payload(v.object({ defaultChat: v.optional(v.string()) }))
 			.reduce((state, payload) => {
 				if (payload.defaultChat === undefined) {
@@ -614,10 +640,11 @@ const session = durableChannel()
 				}
 				return { ...state, defaultChat: payload.defaultChat };
 			})
-			.effect(touched("status"))
+			.effect(touched("status")),
 	)
 	.action((a) =>
-		a.name("session/activityChanged")
+		a
+			.name("session/activityChanged")
 			.payload(v.object({ activity: v.optional(v.string()) }))
 			.reduce((state, payload) => {
 				if (payload.activity === undefined) {
@@ -626,10 +653,11 @@ const session = durableChannel()
 				}
 				return { ...state, activity: payload.activity };
 			})
-			.effect(touched("activity"))
+			.effect(touched("activity")),
 	)
 	.action((a) =>
-		a.name("session/titleChanged")
+		a
+			.name("session/titleChanged")
 			.payload(v.object({ title: v.string() }))
 			.client()
 			.reduce((state, payload) => {
@@ -639,24 +667,27 @@ const session = durableChannel()
 				}
 				return { ...state, title: payload.title };
 			})
-			.effect(touched("title"))
+			.effect(touched("title")),
 	)
 	.action((a) =>
-		a.name("session/isReadChanged")
+		a
+			.name("session/isReadChanged")
 			.payload(v.object({ isRead: v.boolean() }))
 			.client()
 			.reduce((state, payload) => ({ ...state, status: withStatusFlag(state.status, STATUS.IsRead, payload.isRead) }))
-			.effect(touched("status"))
+			.effect(touched("status")),
 	)
 	.action((a) =>
-		a.name("session/isArchivedChanged")
+		a
+			.name("session/isArchivedChanged")
 			.payload(v.object({ isArchived: v.boolean() }))
 			.client()
 			.reduce((state, payload) => ({ ...state, status: withStatusFlag(state.status, STATUS.IsArchived, payload.isArchived) }))
-			.effect(touched("status"))
+			.effect(touched("status")),
 	)
 	.action((a) =>
-		a.name("session/workingDirectorySet")
+		a
+			.name("session/workingDirectorySet")
 			.payload(v.object({ directory: v.string() }))
 			.client()
 			.reduce((state, payload) => {
@@ -665,10 +696,11 @@ const session = durableChannel()
 					return state;
 				}
 				return { ...state, workingDirectories: [...directories, payload.directory] };
-			})
+			}),
 	)
 	.action((a) =>
-		a.name("session/workingDirectoryRemoved")
+		a
+			.name("session/workingDirectoryRemoved")
 			.payload(v.object({ directory: v.string() }))
 			.client()
 			.reduce((state, payload) => {
@@ -677,16 +709,19 @@ const session = durableChannel()
 					return state;
 				}
 				return { ...state, workingDirectories: directories.filter((directory) => directory !== payload.directory) };
-			})
+			}),
 	)
 	.command((c) =>
-		c.name("createChat")
-			.params(v.object({
-				chat: v.string(),
-				initialMessage: v.optional(MessageSchema),
-				source: v.optional(opaque<NonNullable<ahp.CreateChatParams["source"]>>()),
-				workingDirectories: v.optional(v.array(v.string())),
-			}))
+		c
+			.name("createChat")
+			.params(
+				v.object({
+					chat: v.string(),
+					initialMessage: v.optional(MessageSchema),
+					source: v.optional(opaque<NonNullable<ahp.CreateChatParams["source"]>>()),
+					workingDirectories: v.optional(v.array(v.string())),
+				}),
+			)
 			.result(v.null())
 			.handler(async (params, ctx) => {
 				const state = await ctx.state();
@@ -705,7 +740,7 @@ const session = durableChannel()
 					...(params.workingDirectories !== undefined ? { workingDirectories: params.workingDirectories } : {}),
 				});
 				await ctx.dispatch(X_CATALOG, "catalog/chatAdded", { chat: params.chat, session: ctx.uri });
-				await ctx.dispatch(ctx.uri, "session/chatAdded", { summary: chatSummaryOf(await ctx.get(params.chat) as ChatStateShape) });
+				await ctx.dispatch(ctx.uri, "session/chatAdded", { summary: chatSummaryOf((await ctx.get(params.chat)) as ChatStateShape) });
 				if (state.defaultChat === undefined) {
 					await ctx.dispatch(ctx.uri, "session/defaultChatChanged", { defaultChat: params.chat });
 				}
@@ -717,10 +752,11 @@ const session = durableChannel()
 					});
 				}
 				return null;
-			})
+			}),
 	)
 	.command((c) =>
-		c.name("disposeSession")
+		c
+			.name("disposeSession")
 			.params(v.object({}))
 			.result(v.null())
 			.handler(async (_params, ctx) => {
@@ -733,7 +769,7 @@ const session = durableChannel()
 				await ctx.dispatch(AHP_ROOT, "root/activeSessionsChanged", { activeSessions: await countSessions(ctx) });
 				await ctx.notify(AHP_ROOT, "root/sessionRemoved", { session: ctx.uri });
 				return null;
-			})
+			}),
 	)
 	.build();
 
@@ -752,7 +788,7 @@ function isErrorPart(part: ResponsePart): boolean {
 
 /** The session a chat belongs to. `ChatState` never names its parent, so the private index does. */
 async function sessionOf(ctx: { get(uri: string): Promise<unknown> }, chat: string): Promise<string | undefined> {
-	return (await ctx.get(X_CATALOG) as CatalogueShape).chats[chat]?.session;
+	return ((await ctx.get(X_CATALOG)) as CatalogueShape).chats[chat]?.session;
 }
 
 /**
@@ -784,13 +820,16 @@ const chat = durableChannel()
 	.env<Env>()
 	.state(ChatStateSchema, initialChatState)
 	.action((a) =>
-		a.name("chat/turnStarted")
-			.payload(v.object({
-				turnId: v.string(),
-				startedAt: v.string(),
-				message: MessageSchema,
-				queuedMessageId: v.optional(v.string()),
-			}))
+		a
+			.name("chat/turnStarted")
+			.payload(
+				v.object({
+					turnId: v.string(),
+					startedAt: v.string(),
+					message: MessageSchema,
+					queuedMessageId: v.optional(v.string()),
+				}),
+			)
 			.client()
 			.reduce((state, payload) => {
 				// Host policy, not protocol: `dispatchAction` is a notification, so a busy chat can only
@@ -828,44 +867,51 @@ const chat = durableChannel()
 					await ctx.dispatch(ctx.uri, "chat/activityChanged", {});
 					await ctx.dispatch(ctx.uri, "chat/turnComplete", { turnId, duration: TURN_DURATION_MS });
 				});
-			})
+			}),
 	)
 	.action((a) =>
-		a.name("chat/responsePart")
+		a
+			.name("chat/responsePart")
 			.payload(v.object({ turnId: v.string(), part: ResponsePartSchema }))
 			.reduce((state, payload) =>
 				// An error part is ignored here exactly as in the canonical reducer: `chat/error` carries it.
-				isErrorPart(payload.part) ? state : withActiveTurn(state, payload.turnId, (turn) => ({
-					...turn,
-					responseParts: [...turn.responseParts, payload.part],
-				}))
-			)
+				isErrorPart(payload.part)
+					? state
+					: withActiveTurn(state, payload.turnId, (turn) => ({
+							...turn,
+							responseParts: [...turn.responseParts, payload.part],
+						})),
+			),
 	)
 	.action((a) =>
-		a.name("chat/delta")
+		a
+			.name("chat/delta")
 			.payload(v.object({ turnId: v.string(), partId: v.string(), content: v.string() }))
 			.reduce((state, payload) =>
 				withActiveTurn(state, payload.turnId, (turn) => ({
 					...turn,
 					responseParts: turn.responseParts.map((part) =>
-						isMarkdownPart(part) && part.id === payload.partId ? { ...part, content: part.content + payload.content } : part
+						isMarkdownPart(part) && part.id === payload.partId ? { ...part, content: part.content + payload.content } : part,
 					),
-				}))
-			)
+				})),
+			),
 	)
 	.action((a) =>
-		a.name("chat/usage")
+		a
+			.name("chat/usage")
 			.payload(v.object({ turnId: v.string(), usage: opaque<UsageInfo>() }))
-			.reduce((state, payload) => withActiveTurn(state, payload.turnId, (turn) => ({ ...turn, usage: payload.usage })))
+			.reduce((state, payload) => withActiveTurn(state, payload.turnId, (turn) => ({ ...turn, usage: payload.usage }))),
 	)
 	.action((a) =>
-		a.name("chat/turnComplete")
+		a
+			.name("chat/turnComplete")
 			.payload(v.object({ turnId: v.string(), duration: v.number() }))
 			.reduce((state, payload) => endTurn(state, payload.turnId, TURN.Complete, payload.duration))
-			.effect(announced(turnProgress))
+			.effect(announced(turnProgress)),
 	)
 	.action((a) =>
-		a.name("chat/turnCancelled")
+		a
+			.name("chat/turnCancelled")
 			.payload(v.object({ turnId: v.string(), duration: v.number() }))
 			.client()
 			.reduce((state, payload) => endTurn(state, payload.turnId, TURN.Cancelled, payload.duration))
@@ -873,16 +919,18 @@ const chat = durableChannel()
 				// The agent is background work owned by this URI; cancelling the turn is what stops it.
 				ctx.abortBackground();
 				await announced(turnProgress)(ctx);
-			})
+			}),
 	)
 	.action((a) =>
-		a.name("chat/error")
+		a
+			.name("chat/error")
 			.payload(v.object({ turnId: v.string(), duration: v.number(), part: ErrorResponsePartSchema }))
 			.reduce((state, payload) => endTurn(state, payload.turnId, TURN.Error, payload.duration, STATUS.Error, payload.part))
-			.effect(announced(turnProgress))
+			.effect(announced(turnProgress)),
 	)
 	.action((a) =>
-		a.name("chat/activityChanged")
+		a
+			.name("chat/activityChanged")
 			.payload(v.object({ activity: v.optional(v.string()) }))
 			.reduce((state, payload) => {
 				const next = { ...state };
@@ -893,10 +941,11 @@ const chat = durableChannel()
 				}
 				return next;
 			})
-			.effect(announced((state) => ({ activity: state.activity })))
+			.effect(announced((state) => ({ activity: state.activity }))),
 	)
 	.action((a) =>
-		a.name("chat/truncated")
+		a
+			.name("chat/truncated")
 			.payload(v.object({ turnId: v.optional(v.string()) }))
 			.client()
 			.reduce((state, payload) => {
@@ -917,10 +966,11 @@ const chat = durableChannel()
 				}
 				return { ...next, status: chatStatus(next) };
 			})
-			.effect(announced(turnProgress))
+			.effect(announced(turnProgress)),
 	)
 	.action((a) =>
-		a.name("chat/draftChanged")
+		a
+			.name("chat/draftChanged")
 			.payload(v.object({ draft: v.optional(MessageSchema) }))
 			.client()
 			.reduce((state, payload) => {
@@ -931,10 +981,11 @@ const chat = durableChannel()
 					next.draft = payload.draft;
 				}
 				return next;
-			})
+			}),
 	)
 	.action((a) =>
-		a.name("chat/workingDirectorySet")
+		a
+			.name("chat/workingDirectorySet")
 			.payload(v.object({ directory: v.string() }))
 			.client()
 			.reduce((state, payload) => {
@@ -943,10 +994,11 @@ const chat = durableChannel()
 					return state;
 				}
 				return { ...state, workingDirectories: [...directories, payload.directory] };
-			})
+			}),
 	)
 	.action((a) =>
-		a.name("chat/workingDirectoryRemoved")
+		a
+			.name("chat/workingDirectoryRemoved")
 			.payload(v.object({ directory: v.string() }))
 			.client()
 			.reduce((state, payload) => {
@@ -955,10 +1007,11 @@ const chat = durableChannel()
 					return state;
 				}
 				return { ...state, workingDirectories: directories.filter((directory) => directory !== payload.directory) };
-			})
+			}),
 	)
 	.command((c) =>
-		c.name("disposeChat")
+		c
+			.name("disposeChat")
 			.params(v.object({}))
 			.result(v.null())
 			.handler(async (_params, ctx) => {
@@ -970,10 +1023,11 @@ const chat = durableChannel()
 					await ctx.dispatch(session, "session/chatRemoved", { chat: ctx.uri });
 				}
 				return null;
-			})
+			}),
 	)
 	.command((c) =>
-		c.name("fetchTurns")
+		c
+			.name("fetchTurns")
 			.params(v.object({ cursor: v.optional(v.string()) }))
 			.result(v.null())
 			.handler((params) => {
@@ -983,7 +1037,7 @@ const chat = durableChannel()
 					throw new AhpError(-32602, `INVALID_CURSOR: "${params.cursor}" is not a page boundary`);
 				}
 				return null;
-			})
+			}),
 	)
 	.build();
 
@@ -991,41 +1045,54 @@ const catalogue = durableChannel()
 	.env<Env>()
 	.state(CatalogueStateSchema, { sessions: {}, chats: {} })
 	.action((a) =>
-		a.name("catalog/sessionAdded")
+		a
+			.name("catalog/sessionAdded")
 			.payload(v.object({ session: v.string(), createdAt: v.string(), modifiedAt: v.string() }))
 			.reduce((state, payload) => ({
 				...state,
 				sessions: { ...state.sessions, [payload.session]: { createdAt: payload.createdAt, modifiedAt: payload.modifiedAt } },
-			}))
+			})),
 	)
 	.action((a) =>
-		a.name("catalog/sessionTouched").payload(v.object({ session: v.string(), modifiedAt: v.string() })).reduce((state, payload) => {
-			const entry = state.sessions[payload.session];
-			if (entry === undefined) {
-				return state;
-			}
-			return { ...state, sessions: { ...state.sessions, [payload.session]: { ...entry, modifiedAt: payload.modifiedAt } } };
-		})
+		a
+			.name("catalog/sessionTouched")
+			.payload(v.object({ session: v.string(), modifiedAt: v.string() }))
+			.reduce((state, payload) => {
+				const entry = state.sessions[payload.session];
+				if (entry === undefined) {
+					return state;
+				}
+				return { ...state, sessions: { ...state.sessions, [payload.session]: { ...entry, modifiedAt: payload.modifiedAt } } };
+			}),
 	)
 	.action((a) =>
-		a.name("catalog/sessionRemoved").payload(v.object({ session: v.string() })).reduce((state, payload) => {
-			const sessions = { ...state.sessions };
-			delete sessions[payload.session];
-			return { ...state, sessions };
-		})
+		a
+			.name("catalog/sessionRemoved")
+			.payload(v.object({ session: v.string() }))
+			.reduce((state, payload) => {
+				const sessions = { ...state.sessions };
+				delete sessions[payload.session];
+				return { ...state, sessions };
+			}),
 	)
 	.action((a) =>
-		a.name("catalog/chatAdded").payload(v.object({ chat: v.string(), session: v.string() })).reduce((state, payload) => ({
-			...state,
-			chats: { ...state.chats, [payload.chat]: { session: payload.session } },
-		}))
+		a
+			.name("catalog/chatAdded")
+			.payload(v.object({ chat: v.string(), session: v.string() }))
+			.reduce((state, payload) => ({
+				...state,
+				chats: { ...state.chats, [payload.chat]: { session: payload.session } },
+			})),
 	)
 	.action((a) =>
-		a.name("catalog/chatRemoved").payload(v.object({ chat: v.string() })).reduce((state, payload) => {
-			const chats = { ...state.chats };
-			delete chats[payload.chat];
-			return { ...state, chats };
-		})
+		a
+			.name("catalog/chatRemoved")
+			.payload(v.object({ chat: v.string() }))
+			.reduce((state, payload) => {
+				const chats = { ...state.chats };
+				delete chats[payload.chat];
+				return { ...state, chats };
+			}),
 	)
 	.build();
 
@@ -1056,7 +1123,7 @@ interface WireEnvelope {
 }
 
 function fields(payload: unknown): Record<string, unknown> {
-	return typeof payload === "object" && payload !== null && !Array.isArray(payload) ? payload as Record<string, unknown> : {};
+	return typeof payload === "object" && payload !== null && !Array.isArray(payload) ? (payload as Record<string, unknown>) : {};
 }
 
 function toWireEnvelope(envelope: Extract<DurableChannelMessage, { type: "action" }>): WireEnvelope {
@@ -1109,7 +1176,7 @@ const WireEnvelopeSchema = v.object({
  * `NotFound` and `AlreadyExists`, so the mapping needs the URI the call was about.
  */
 function rpcCodeFor(code: string, uri: string | undefined): number {
-	const session = uri !== undefined && uri.startsWith("ahp-session:");
+	const session = uri?.startsWith("ahp-session:");
 	switch (code) {
 		case "CHANNEL_NOT_FOUND":
 		case "ROUTE_NOT_FOUND":
@@ -1150,22 +1217,27 @@ const ahpRpc = new Hana(
 	hana()
 		.env<RpcEnv>()
 		.def((b) =>
-			b.name("initialize")
-				.params(v.object({
-					channel: v.literal(AHP_ROOT),
-					clientId: v.pipe(v.string(), v.minLength(1)),
-					protocolVersions: v.pipe(v.array(v.string()), v.minLength(1)),
-					clientInfo: v.optional(v.unknown()),
-					initialSubscriptions: v.optional(v.array(v.string()), []),
-					locale: v.optional(v.string()),
-					capabilities: v.optional(v.unknown()),
-				}))
-				.result(v.object({
-					protocolVersion: v.string(),
-					serverSeq: v.number(),
-					serverInfo: v.object({ name: v.string(), version: v.string() }),
-					snapshots: v.array(WireSnapshot),
-				}))
+			b
+				.name("initialize")
+				.params(
+					v.object({
+						channel: v.literal(AHP_ROOT),
+						clientId: v.pipe(v.string(), v.minLength(1)),
+						protocolVersions: v.pipe(v.array(v.string()), v.minLength(1)),
+						clientInfo: v.optional(v.unknown()),
+						initialSubscriptions: v.optional(v.array(v.string()), []),
+						locale: v.optional(v.string()),
+						capabilities: v.optional(v.unknown()),
+					}),
+				)
+				.result(
+					v.object({
+						protocolVersion: v.string(),
+						serverSeq: v.number(),
+						serverInfo: v.object({ name: v.string(), version: v.string() }),
+						snapshots: v.array(WireSnapshot),
+					}),
+				)
 				.handler(async (params, ctx) => {
 					ctx.env.calls.initialize = (ctx.env.calls.initialize ?? 0) + 1;
 					const protocolVersion = params.protocolVersions.find((offer) => SUPPORTED_PROTOCOL_VERSIONS.includes(offer as never));
@@ -1196,29 +1268,35 @@ const ahpRpc = new Hana(
 						serverInfo: { name: "durable-channel-ahp-test", version: "0.1.0" },
 						snapshots,
 					};
-				})
+				}),
 		)
 		.def((b) =>
-			b.name("ping")
+			b
+				.name("ping")
 				.params(v.object({ channel: v.optional(v.string()) }))
 				.result(v.null())
 				.handler((_params, ctx) => {
 					ctx.env.calls.ping = (ctx.env.calls.ping ?? 0) + 1;
 					return null;
-				})
+				}),
 		)
 		.def((b) =>
-			b.name("reconnect")
-				.params(v.object({
-					channel: v.literal(AHP_ROOT),
-					clientId: v.pipe(v.string(), v.minLength(1)),
-					lastSeenServerSeq: v.number(),
-					subscriptions: v.array(v.string()),
-				}))
-				.result(v.union([
-					v.object({ type: v.literal("replay"), actions: v.array(WireEnvelopeSchema), missing: v.array(v.string()) }),
-					v.object({ type: v.literal("snapshot"), snapshots: v.array(WireSnapshot), missing: v.array(v.string()) }),
-				]))
+			b
+				.name("reconnect")
+				.params(
+					v.object({
+						channel: v.literal(AHP_ROOT),
+						clientId: v.pipe(v.string(), v.minLength(1)),
+						lastSeenServerSeq: v.number(),
+						subscriptions: v.array(v.string()),
+					}),
+				)
+				.result(
+					v.union([
+						v.object({ type: v.literal("replay"), actions: v.array(WireEnvelopeSchema), missing: v.array(v.string()) }),
+						v.object({ type: v.literal("snapshot"), snapshots: v.array(WireSnapshot), missing: v.array(v.string()) }),
+					]),
+				)
 				.handler((params, ctx) => {
 					ctx.env.calls.reconnect = (ctx.env.calls.reconnect ?? 0) + 1;
 					ctx.env.link?.bind(params.clientId);
@@ -1230,10 +1308,11 @@ const ahpRpc = new Hana(
 							? { type: "replay" as const, actions: result.actions.map(toWireEnvelope), missing }
 							: { type: "snapshot" as const, snapshots: [...result.snapshots], missing };
 					});
-				})
+				}),
 		)
 		.def((b) =>
-			b.name("subscribe")
+			b
+				.name("subscribe")
 				.params(v.object({ channel: v.string(), delivery: v.optional(v.unknown()), view: v.optional(v.unknown()) }))
 				.result(v.object({ snapshot: v.optional(WireSnapshot) }))
 				.handler((params, ctx) => {
@@ -1243,20 +1322,22 @@ const ahpRpc = new Hana(
 						const snapshot = await ctx.env.hub.subscribe(connection, params.channel);
 						return snapshot === undefined ? {} : { snapshot };
 					}, params.channel);
-				})
+				}),
 		)
 		.def((b) =>
-			b.name("unsubscribe")
+			b
+				.name("unsubscribe")
 				.params(v.object({ channel: v.string() }))
 				.result(v.null())
 				.handler((params, ctx) => {
 					ctx.env.calls.unsubscribe = (ctx.env.calls.unsubscribe ?? 0) + 1;
 					ctx.env.hub.unsubscribe(boundConnection(ctx.env.link), params.channel);
 					return null;
-				})
+				}),
 		)
 		.def((b) =>
-			b.name("dispatchAction")
+			b
+				.name("dispatchAction")
 				.params(v.object({ channel: v.string(), clientSeq: v.number(), action: v.looseObject({ type: v.string() }) }))
 				.result(v.nullable(WireEnvelopeSchema))
 				.handler((params, ctx) => {
@@ -1267,27 +1348,31 @@ const ahpRpc = new Hana(
 						const envelope = await ctx.env.hub.dispatchFrom(connection, params.channel, name, payload, params.clientSeq, { lenient: true });
 						return envelope === undefined ? null : toWireEnvelope(envelope);
 					}, params.channel);
-				})
+				}),
 		)
 		.def((b) =>
-			b.name("listSessions")
+			b
+				.name("listSessions")
 				.params(v.object({ channel: v.literal(AHP_ROOT), limit: v.optional(v.number()), cursor: v.optional(v.string()) }))
 				.result(v.object({ items: v.array(v.unknown()), nextCursor: v.optional(v.string()) }))
 				.handler((params, ctx) => {
 					ctx.env.calls.listSessions = (ctx.env.calls.listSessions ?? 0) + 1;
 					return guarded(() => ctx.env.hub.exec(AHP_ROOT, "listSessions", { limit: params.limit, cursor: params.cursor }));
-				})
+				}),
 		)
 		.def((b) =>
-			b.name("createSession")
-				.params(v.object({
-					channel: v.string(),
-					provider: v.optional(v.string()),
-					workingDirectories: v.optional(v.array(v.string())),
-					config: v.optional(v.record(v.string(), v.unknown())),
-					activeClient: v.optional(opaque<SessionState["activeClients"][number]>()),
-					progressToken: v.optional(v.unknown()),
-				}))
+			b
+				.name("createSession")
+				.params(
+					v.object({
+						channel: v.string(),
+						provider: v.optional(v.string()),
+						workingDirectories: v.optional(v.array(v.string())),
+						config: v.optional(v.record(v.string(), v.unknown())),
+						activeClient: v.optional(opaque<SessionState["activeClients"][number]>()),
+						progressToken: v.optional(v.unknown()),
+					}),
+				)
 				.result(v.null())
 				.handler((params, ctx) => {
 					ctx.env.calls.createSession = (ctx.env.calls.createSession ?? 0) + 1;
@@ -1303,10 +1388,11 @@ const ahpRpc = new Hana(
 							}),
 						params.channel,
 					);
-				})
+				}),
 		)
 		.def((b) =>
-			b.name("disposeSession")
+			b
+				.name("disposeSession")
 				.params(v.object({ channel: v.string() }))
 				.result(v.null())
 				.handler((params, ctx) => {
@@ -1316,17 +1402,20 @@ const ahpRpc = new Hana(
 						await ctx.env.hub.execFrom(connection, params.channel, "disposeSession", {});
 						return null;
 					}, params.channel);
-				})
+				}),
 		)
 		.def((b) =>
-			b.name("createChat")
-				.params(v.object({
-					channel: v.string(),
-					chat: v.string(),
-					initialMessage: v.optional(v.unknown()),
-					source: v.optional(v.unknown()),
-					workingDirectories: v.optional(v.array(v.string())),
-				}))
+			b
+				.name("createChat")
+				.params(
+					v.object({
+						channel: v.string(),
+						chat: v.string(),
+						initialMessage: v.optional(v.unknown()),
+						source: v.optional(v.unknown()),
+						workingDirectories: v.optional(v.array(v.string())),
+					}),
+				)
 				.result(v.null())
 				.handler((params, ctx) => {
 					ctx.env.calls.createChat = (ctx.env.calls.createChat ?? 0) + 1;
@@ -1341,10 +1430,11 @@ const ahpRpc = new Hana(
 						});
 						return null;
 					}, params.channel);
-				})
+				}),
 		)
 		.def((b) =>
-			b.name("disposeChat")
+			b
+				.name("disposeChat")
 				.params(v.object({ channel: v.string() }))
 				.result(v.null())
 				.handler((params, ctx) => {
@@ -1354,10 +1444,11 @@ const ahpRpc = new Hana(
 						await ctx.env.hub.execFrom(connection, params.channel, "disposeChat", {});
 						return null;
 					}, params.channel);
-				})
+				}),
 		)
 		.def((b) =>
-			b.name("fetchTurns")
+			b
+				.name("fetchTurns")
 				.params(v.object({ channel: v.string(), cursor: v.optional(v.string()) }))
 				.result(v.object({}))
 				.handler((params, ctx) => {
@@ -1366,7 +1457,7 @@ const ahpRpc = new Hana(
 						await ctx.env.hub.exec(params.channel, "fetchTurns", { cursor: params.cursor });
 						return {};
 					}, params.channel);
-				})
+				}),
 		)
 		.build(),
 );
@@ -1381,14 +1472,7 @@ interface Socket {
 /** The deterministic agent: the same three chunks for any prompt, and no clock and no randomness. */
 const fakeAgent = { reply: () => ["Hello", ", ", "world"] };
 
-function boot(
-	options?: {
-		storage?: DurableChannelStorage;
-		replayLimit?: number;
-		now?: () => string;
-		tick?: () => Promise<void>;
-	},
-) {
+async function boot(options?: { storage?: DurableChannelStorage; replayLimit?: number; now?: () => string; tick?: () => Promise<void> }) {
 	const hub = makeHub({
 		storage: options?.storage ?? new MemoryStorage(),
 		env: {
@@ -1477,24 +1561,23 @@ function boot(
 			};
 		}),
 	);
-	const listener = Deno.serve({ port: 0, hostname: "127.0.0.1", onListen() {} }, app.fetch);
-	const { port } = listener.addr as Deno.NetAddr;
+	const listener = await serveApp(app);
 	return {
 		hub,
 		calls,
-		url: `ws://127.0.0.1:${port}/rpc`,
+		url: listener.url("/rpc"),
 		/** Unclean close, so the official transport reports a drop and `MultiHostClient` reconnects. */
 		drop(clientId: string): void {
 			bindings.get(clientId)?.close(1012);
 		},
 		async stop(): Promise<void> {
 			// Before the sockets: a background task still streaming would otherwise outlive the test and
-			// trip the op sanitizer.
+			// keep the listener alive.
 			await withTimeout(hub.close(), "the hub's background tasks to settle");
 			for (const socket of [...live]) {
 				socket.close(1000);
 			}
-			await withTimeout(listener.shutdown(), "the listener to shut down");
+			await withTimeout(listener.stop(), "the listener to shut down");
 		},
 	};
 }
@@ -1533,7 +1616,7 @@ async function nextEvent<T extends string>(
 ): Promise<Extract<Awaited<ReturnType<Subscription["next"]>>["value"], { type: T }>> {
 	for (;;) {
 		const step = await withTimeout(subscription.next(), what);
-		assert(!step.done, `subscription closed while waiting for ${what}`);
+		ok(!step.done, `subscription closed while waiting for ${what}`);
 		if (step.value.type === type) {
 			return step.value as never;
 		}
@@ -1560,7 +1643,7 @@ async function quiet(events: AsyncIterableIterator<ClientEvent>, ms: number): Pr
 }
 
 /**
- * Drives a bare socket so the test can assert on frames the official client would drop. A frame
+ * Drives a bare socket so the test can ok on frames the official client would drop. A frame
  * carrying an `id` is a request and the next frame waits for its response; a notification has no
  * response, so it gets a short grace period instead.
  */
@@ -1662,7 +1745,7 @@ function ticking(stepMs = 1000): () => string {
 /** The live client of a `MultiHostClient` host, or a failure naming the host that has none. */
 function hostClient(multi: MultiHostClient, id: string): HostClientHandle {
 	const client = multi.client(id);
-	assert(client !== undefined, `host "${id}" has no live client`);
+	ok(client !== undefined, `host "${id}" has no live client`);
 	return client;
 }
 
@@ -1673,7 +1756,7 @@ async function until(what: string, predicate: () => boolean, ms = 2000): Promise
 		}
 		await sleep(10);
 	}
-	assert(predicate(), `timed out waiting for ${what}`);
+	ok(predicate(), `timed out waiting for ${what}`);
 }
 
 // ─── Scenarios ───────────────────────────────────────────────────────────────
@@ -1684,15 +1767,15 @@ describe("AHP root channel", () => {
 	it("pins the protocol constants the test relies on", () => {
 		const actionType = (ahp as unknown as { ActionType: Record<string, string> }).ActionType;
 		const errorCodes = (ahp as unknown as { AhpErrorCodes: Record<string, number> }).AhpErrorCodes;
-		assertEquals(PROTOCOL_VERSION, "0.9.0");
-		assertEquals(actionType.RootAgentsChanged, "root/agentsChanged");
-		assertEquals(actionType.RootActiveSessionsChanged, "root/activeSessionsChanged");
-		assertEquals(actionType.RootConfigChanged, "root/configChanged");
-		assertEquals(errorCodes.UnsupportedProtocolVersion, -32005);
+		deepStrictEqual(PROTOCOL_VERSION, "0.9.0");
+		deepStrictEqual(actionType.RootAgentsChanged, "root/agentsChanged");
+		deepStrictEqual(actionType.RootActiveSessionsChanged, "root/activeSessionsChanged");
+		deepStrictEqual(actionType.RootConfigChanged, "root/configChanged");
+		deepStrictEqual(errorCodes.UnsupportedProtocolVersion, -32005);
 	});
 
 	it("negotiates the handshake", async () => {
-		const host = boot();
+		const host = await boot();
 		const { client } = await connect(host.url);
 		try {
 			const result = await withTimeout(
@@ -1703,13 +1786,13 @@ describe("AHP root channel", () => {
 				}),
 				"the initialize result",
 			);
-			assertEquals(result.protocolVersion, "0.9.0");
-			assertEquals(typeof result.serverSeq, "number");
-			assertEquals(result.serverInfo, { name: "durable-channel-ahp-test", version: "0.1.0" });
-			assertEquals(result.snapshots.length, 1);
-			assertEquals(result.snapshots[0].resource, AHP_ROOT);
-			assertEquals((result.snapshots[0].state as RootState).agents.length, 1);
-			assertEquals(result.snapshots[0].fromSeq, result.serverSeq);
+			deepStrictEqual(result.protocolVersion, "0.9.0");
+			deepStrictEqual(typeof result.serverSeq, "number");
+			deepStrictEqual(result.serverInfo, { name: "durable-channel-ahp-test", version: "0.1.0" });
+			deepStrictEqual(result.snapshots.length, 1);
+			deepStrictEqual(result.snapshots[0].resource, AHP_ROOT);
+			deepStrictEqual((result.snapshots[0].state as RootState).agents.length, 1);
+			deepStrictEqual(result.snapshots[0].fromSeq, result.serverSeq);
 		} finally {
 			await client.shutdown();
 			await host.stop();
@@ -1717,19 +1800,20 @@ describe("AHP root channel", () => {
 	});
 
 	it("answers ping before initialize and refuses an unknown version", async () => {
-		const host = boot();
+		const host = await boot();
 		const first = await connect(host.url);
 		const unversioned = await connect(host.url);
 		const rejected = await connect(host.url);
 		try {
 			await handshake(first.client, crypto.randomUUID());
 			await withTimeout(unversioned.client.ping(), "a ping before initialize");
-			const error = await rejected.client
-				.initialize({ clientId: crypto.randomUUID(), protocolVersions: ["9.9.9"] })
-				.then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(error, RpcError);
-			assertEquals(error.code, -32005);
-			assertEquals((error.data as { supportedVersions: string[] }).supportedVersions, [...SUPPORTED_PROTOCOL_VERSIONS]);
+			const error = await rejected.client.initialize({ clientId: crypto.randomUUID(), protocolVersions: ["9.9.9"] }).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(error instanceof RpcError);
+			deepStrictEqual(error.code, -32005);
+			deepStrictEqual((error.data as { supportedVersions: string[] }).supportedVersions, [...SUPPORTED_PROTOCOL_VERSIONS]);
 			await until("the server to close the socket after -32005", () => rejected.transport.lastClose !== null, 1000);
 		} finally {
 			await Promise.all([first, unversioned, rejected].map((entry) => entry.client.shutdown()));
@@ -1738,18 +1822,24 @@ describe("AHP root channel", () => {
 	});
 
 	it("rejects a malformed initialize", async () => {
-		const host = boot();
+		const host = await boot();
 		const { client } = await connect(host.url);
 		try {
 			const clientId = crypto.randomUUID();
 			const wrongChannel = await client
 				.request("initialize", { channel: "ahp-session:/x", clientId, protocolVersions: [PROTOCOL_VERSION] } as never)
-				.then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(wrongChannel, RpcError);
-			assertEquals(wrongChannel.code, -32602);
-			const tooEarly = await client.subscribe(AHP_ROOT).then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(tooEarly, RpcError);
-			assertEquals(tooEarly.code, -32000);
+				.then(
+					() => undefined,
+					(caught: unknown) => caught,
+				);
+			ok(wrongChannel instanceof RpcError);
+			deepStrictEqual(wrongChannel.code, -32602);
+			const tooEarly = await client.subscribe(AHP_ROOT).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(tooEarly instanceof RpcError);
+			deepStrictEqual(tooEarly.code, -32000);
 		} finally {
 			await client.shutdown();
 			await host.stop();
@@ -1757,7 +1847,7 @@ describe("AHP root channel", () => {
 	});
 
 	it("streams server-origin actions to root subscribers and stops after unsubscribe", async () => {
-		const host = boot();
+		const host = await boot();
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -1765,14 +1855,14 @@ describe("AHP root channel", () => {
 			const agents = [demoAgent, otherAgent];
 			const committed = await host.hub.dispatch(AHP_ROOT, "root/agentsChanged", { agents });
 			const envelope = await nextAction(subscription, "the agents echo");
-			assertEquals(envelope.channel, AHP_ROOT);
-			assertEquals(envelope.action as unknown as Record<string, unknown>, { type: "root/agentsChanged", agents });
-			assertEquals(envelope.serverSeq, committed.serverSeq);
-			assert(!("origin" in envelope) || envelope.origin === undefined, "a server-origin envelope carries no origin");
+			deepStrictEqual(envelope.channel, AHP_ROOT);
+			deepStrictEqual(envelope.action as unknown as Record<string, unknown>, { type: "root/agentsChanged", agents });
+			deepStrictEqual(envelope.serverSeq, committed.serverSeq);
+			ok(!("origin" in envelope) || envelope.origin === undefined, "a server-origin envelope carries no origin");
 			await client.unsubscribe(AHP_ROOT);
 			await sleep(100);
 			await host.hub.dispatch(AHP_ROOT, "root/agentsChanged", { agents: [demoAgent] });
-			assertEquals(await quiet(client.events(), 250), "quiet");
+			deepStrictEqual(await quiet(client.events(), 250), "quiet");
 		} finally {
 			await client.shutdown();
 			await host.stop();
@@ -1780,7 +1870,7 @@ describe("AHP root channel", () => {
 	});
 
 	it("echoes a client action with its origin and keeps AhpStateMirror equal to the server", async () => {
-		const host = boot();
+		const host = await boot();
 		const { client } = await connect(host.url);
 		try {
 			const clientId = crypto.randomUUID();
@@ -1789,22 +1879,22 @@ describe("AHP root channel", () => {
 			mirror.applySnapshot(result.snapshots[0] as Snapshot);
 			const subscription = client.attachSubscription(AHP_ROOT);
 			const handle = client.dispatch(AHP_ROOT, { type: "root/configChanged", config: { theme: "dark" } } as never);
-			assertEquals(handle.clientSeq, 1);
+			deepStrictEqual(handle.clientSeq, 1);
 			const echo = await nextAction(subscription, "the configChanged echo");
-			assertEquals(echo.origin, { clientId, clientSeq: 1 });
-			assertEquals(echo.rejectionReason, undefined);
+			deepStrictEqual(echo.origin, { clientId, clientSeq: 1 });
+			deepStrictEqual(echo.rejectionReason, undefined);
 			mirror.apply(echo);
 			const resubscribed = await client.subscribe(AHP_ROOT);
-			assertEquals(mirror.root, resubscribed.result.snapshot?.state as RootState);
-			assertEquals(mirror.root, await host.hub.get(AHP_ROOT) as RootState);
-			assertEquals((mirror.root.config as { values: Record<string, unknown> }).values, { theme: "dark", locked: "yes" });
+			deepStrictEqual(mirror.root, resubscribed.result.snapshot?.state as RootState);
+			deepStrictEqual(mirror.root, (await host.hub.get(AHP_ROOT)) as RootState);
+			deepStrictEqual((mirror.root.config as { values: Record<string, unknown> }).values, { theme: "dark", locked: "yes" });
 
 			client.dispatch(AHP_ROOT, { type: "root/configChanged", config: { theme: "light", locked: "yes" }, replace: true } as never);
 			const replaced = await nextAction(subscription, "the replacing configChanged echo");
-			assertEquals(replaced.rejectionReason, undefined);
+			deepStrictEqual(replaced.rejectionReason, undefined);
 			mirror.apply(replaced);
-			assertEquals(mirror.root, await host.hub.get(AHP_ROOT) as RootState);
-			assertEquals(mirror.root, ahp.rootReducer(mirror.root, replaced.action as RootAction));
+			deepStrictEqual(mirror.root, (await host.hub.get(AHP_ROOT)) as RootState);
+			deepStrictEqual(mirror.root, ahp.rootReducer(mirror.root, replaced.action as RootAction));
 			await resubscribed.subscription.close();
 		} finally {
 			await client.shutdown();
@@ -1813,7 +1903,7 @@ describe("AHP root channel", () => {
 	});
 
 	it("answers unacceptable actions with rejected echoes, never error frames", async () => {
-		const host = boot();
+		const host = await boot();
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -1821,27 +1911,28 @@ describe("AHP root channel", () => {
 			const subscription = client.attachSubscription(AHP_ROOT);
 			const reasons: string[] = [];
 			const sequences: number[] = [];
-			for (
-				const action of [
-					{ type: "root/configChanged", config: { locked: "no" } },
-					{ type: "root/bogus", whatever: 1 },
-					{ type: "root/agentsChanged", agents: [] },
-					{ type: "root/configChanged", config: "nope" },
-				]
-			) {
+			for (const action of [
+				{ type: "root/configChanged", config: { locked: "no" } },
+				{ type: "root/bogus", whatever: 1 },
+				{ type: "root/agentsChanged", agents: [] },
+				{ type: "root/configChanged", config: "nope" },
+			]) {
 				client.dispatch(AHP_ROOT, action as never);
 				const echo = await nextAction(subscription, `the rejected echo of ${action.type}`);
 				reasons.push(echo.rejectionReason ?? "");
 				sequences.push(echo.serverSeq);
 			}
-			assertEquals(reasons[0], 'config key "locked" is read-only');
-			assert(reasons[1].startsWith("UNKNOWN_ACTION"), `expected UNKNOWN_ACTION, got ${reasons[1]}`);
-			assert(reasons[2].startsWith("NOT_CLIENT_DISPATCHABLE"), `expected NOT_CLIENT_DISPATCHABLE, got ${reasons[2]}`);
-			assert(reasons[3].startsWith("INVALID_PAYLOAD"), `expected INVALID_PAYLOAD, got ${reasons[3]}`);
-			assertEquals(sequences, [...sequences].sort((a, b) => a - b));
-			assertEquals(new Set(sequences).size, 4);
-			assertEquals(await host.hub.get(AHP_ROOT), before);
-			assertEquals(await quiet(client.events(), 250), "quiet");
+			deepStrictEqual(reasons[0], 'config key "locked" is read-only');
+			ok(reasons[1].startsWith("UNKNOWN_ACTION"), `expected UNKNOWN_ACTION, got ${reasons[1]}`);
+			ok(reasons[2].startsWith("NOT_CLIENT_DISPATCHABLE"), `expected NOT_CLIENT_DISPATCHABLE, got ${reasons[2]}`);
+			ok(reasons[3].startsWith("INVALID_PAYLOAD"), `expected INVALID_PAYLOAD, got ${reasons[3]}`);
+			deepStrictEqual(
+				sequences,
+				[...sequences].sort((a, b) => a - b),
+			);
+			deepStrictEqual(new Set(sequences).size, 4);
+			deepStrictEqual(await host.hub.get(AHP_ROOT), before);
+			deepStrictEqual(await quiet(client.events(), 250), "quiet");
 
 			const frames = await rawExchange(host.url, [
 				{
@@ -1863,9 +1954,15 @@ describe("AHP root channel", () => {
 				},
 				{ jsonrpc: "2.0", method: "unsubscribe", params: { channel: AHP_ROOT } },
 			]);
-			assertEquals(frames.filter((frame) => "error" in frame), []);
-			assertEquals(frames.filter((frame) => frame.method === "action").length, 2);
-			assertEquals(frames.filter((frame) => "id" in frame).map((frame) => frame.id), [1, 2]);
+			deepStrictEqual(
+				frames.filter((frame) => "error" in frame),
+				[],
+			);
+			deepStrictEqual(frames.filter((frame) => frame.method === "action").length, 2);
+			deepStrictEqual(
+				frames.filter((frame) => "id" in frame).map((frame) => frame.id),
+				[1, 2],
+			);
 		} finally {
 			await client.shutdown();
 			await host.stop();
@@ -1873,7 +1970,7 @@ describe("AHP root channel", () => {
 	});
 
 	it("ignores a duplicate clientSeq on the same link", async () => {
-		const host = boot();
+		const host = await boot();
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -1881,10 +1978,10 @@ describe("AHP root channel", () => {
 			const subscription = client.attachSubscription(AHP_ROOT);
 			client.dispatch(AHP_ROOT, { type: "root/configChanged", config: { theme: "dark" } } as never, 1);
 			const echo = await nextAction(subscription, "the only echo");
-			assertEquals(echo.origin?.clientSeq, 1);
+			deepStrictEqual(echo.origin?.clientSeq, 1);
 			client.dispatch(AHP_ROOT, { type: "root/configChanged", config: { theme: "solar" } } as never, 1);
-			assertEquals(await quiet(client.events(), 250), "quiet");
-			assertEquals(host.hub.serverSeq, before + 1);
+			deepStrictEqual(await quiet(client.events(), 250), "quiet");
+			deepStrictEqual(host.hub.serverSeq, before + 1);
 		} finally {
 			await client.shutdown();
 			await host.stop();
@@ -1892,7 +1989,7 @@ describe("AHP root channel", () => {
 	});
 
 	it("replays what a reconnecting client missed and accepts a clientSeq that restarted at 1", async () => {
-		const host = boot();
+		const host = await boot();
 		const clientId = crypto.randomUUID();
 		const first = await connect(host.url);
 		try {
@@ -1911,19 +2008,25 @@ describe("AHP root channel", () => {
 					second.client.reconnect({ clientId, lastSeenServerSeq: lastSeen, subscriptions: [AHP_ROOT, "ahp-session:/none"] }),
 					"the reconnect result",
 				);
-				assertEquals(resumed.type, "replay");
-				assert(resumed.type === "replay");
-				assertEquals(resumed.missing, ["ahp-session:/none"]);
-				assertEquals(resumed.actions.map((envelope) => envelope.serverSeq), [lastSeen + 1, lastSeen + 2]);
-				assertEquals(resumed.actions.map((envelope) => (envelope.action as unknown as { activeSessions: number }).activeSessions), [1, 2]);
+				deepStrictEqual(resumed.type, "replay");
+				ok(resumed.type === "replay");
+				deepStrictEqual(resumed.missing, ["ahp-session:/none"]);
+				deepStrictEqual(
+					resumed.actions.map((envelope) => envelope.serverSeq),
+					[lastSeen + 1, lastSeen + 2],
+				);
+				deepStrictEqual(
+					resumed.actions.map((envelope) => (envelope.action as unknown as { activeSessions: number }).activeSessions),
+					[1, 2],
+				);
 
 				const resubscribed = second.client.attachSubscription(AHP_ROOT);
 				const handle = second.client.dispatch(AHP_ROOT, { type: "root/configChanged", config: { theme: "dusk" } } as never);
-				assertEquals(handle.clientSeq, 1);
+				deepStrictEqual(handle.clientSeq, 1);
 				const again = await nextAction(resubscribed, "the echo after the reconnect");
-				assertEquals(again.origin, { clientId, clientSeq: 1 });
-				assertEquals(again.rejectionReason, undefined);
-				assert(again.serverSeq > lastSeen + 2, "the resent action must consume a fresh serverSeq");
+				deepStrictEqual(again.origin, { clientId, clientSeq: 1 });
+				deepStrictEqual(again.rejectionReason, undefined);
+				ok(again.serverSeq > lastSeen + 2, "the resent action must consume a fresh serverSeq");
 			} finally {
 				await second.client.shutdown();
 			}
@@ -1934,7 +2037,7 @@ describe("AHP root channel", () => {
 	});
 
 	it("falls back to snapshots when the replay ring cannot cover the gap", async () => {
-		const host = boot({ replayLimit: 2 });
+		const host = await boot({ replayLimit: 2 });
 		const clientId = crypto.randomUUID();
 		const first = await connect(host.url);
 		try {
@@ -1949,13 +2052,13 @@ describe("AHP root channel", () => {
 					second.client.reconnect({ clientId, lastSeenServerSeq: lastSeen, subscriptions: [AHP_ROOT] }),
 					"the reconnect result",
 				);
-				assertEquals(resumed.type, "snapshot");
-				assert(resumed.type === "snapshot");
-				assertEquals((resumed as unknown as { missing: string[] }).missing, []);
-				assertEquals(resumed.snapshots.length, 1);
-				assertEquals(resumed.snapshots[0].resource, AHP_ROOT);
-				assertEquals((resumed.snapshots[0].state as RootState).activeSessions, 4);
-				assertEquals(resumed.snapshots[0].fromSeq, host.hub.serverSeq);
+				deepStrictEqual(resumed.type, "snapshot");
+				ok(resumed.type === "snapshot");
+				deepStrictEqual((resumed as unknown as { missing: string[] }).missing, []);
+				deepStrictEqual(resumed.snapshots.length, 1);
+				deepStrictEqual(resumed.snapshots[0].resource, AHP_ROOT);
+				deepStrictEqual((resumed.snapshots[0].state as RootState).activeSessions, 4);
+				deepStrictEqual(resumed.snapshots[0].fromSeq, host.hub.serverSeq);
 			} finally {
 				await second.client.shutdown();
 			}
@@ -1966,7 +2069,7 @@ describe("AHP root channel", () => {
 	});
 
 	it("replaces the link when a second socket claims the same clientId", async () => {
-		const host = boot();
+		const host = await boot();
 		const clientId = crypto.randomUUID();
 		const first = await connect(host.url);
 		const second = await connect(host.url);
@@ -1976,14 +2079,14 @@ describe("AHP root channel", () => {
 			await handshake(second.client, clientId, [AHP_ROOT]);
 			const live = second.client.attachSubscription(AHP_ROOT);
 			await host.hub.dispatch(AHP_ROOT, "root/activeSessionsChanged", { activeSessions: 1 });
-			assertEquals((await nextAction(live, "the echo on the surviving link")).serverSeq, host.hub.serverSeq);
-			assertEquals(await quiet(first.client.events(), 250), "quiet");
+			deepStrictEqual((await nextAction(live, "the echo on the surviving link")).serverSeq, host.hub.serverSeq);
+			deepStrictEqual(await quiet(first.client.events(), 250), "quiet");
 
 			await first.client.shutdown();
 			await sleep(100);
 			await host.hub.dispatch(AHP_ROOT, "root/activeSessionsChanged", { activeSessions: 2 });
 			const survived = await nextAction(live, "the echo after the stale socket closed");
-			assertEquals((survived.action as unknown as { activeSessions: number }).activeSessions, 2);
+			deepStrictEqual((survived.action as unknown as { activeSessions: number }).activeSessions, 2);
 		} finally {
 			await Promise.all([first, second].map((entry) => entry.client.shutdown()));
 			await host.stop();
@@ -1993,7 +2096,7 @@ describe("AHP root channel", () => {
 	it("survives a hub restart on the same storage", async () => {
 		const storage = new MemoryStorage();
 		const clientId = crypto.randomUUID();
-		const first = boot({ storage });
+		const first = await boot({ storage });
 		let lastSeen = 0;
 		try {
 			const { client } = await connect(first.url);
@@ -2007,19 +2110,19 @@ describe("AHP root channel", () => {
 		} finally {
 			await first.stop();
 		}
-		const second = boot({ storage });
+		const second = await boot({ storage });
 		try {
 			await second.hub.ready();
-			assertEquals(second.hub.serverSeq, lastSeen);
-			assertEquals((await second.hub.get(AHP_ROOT) as RootState).activeSessions, 7);
+			deepStrictEqual(second.hub.serverSeq, lastSeen);
+			deepStrictEqual(((await second.hub.get(AHP_ROOT)) as RootState).activeSessions, 7);
 			const caughtUp = await connect(second.url);
 			try {
 				const resumed = await withTimeout(
 					caughtUp.client.reconnect({ clientId, lastSeenServerSeq: lastSeen, subscriptions: [AHP_ROOT] }),
 					"the caught-up reconnect",
 				);
-				assertEquals(resumed.type, "replay");
-				assertEquals(resumed.type === "replay" ? resumed.actions : undefined, []);
+				deepStrictEqual(resumed.type, "replay");
+				deepStrictEqual(resumed.type === "replay" ? resumed.actions : undefined, []);
 			} finally {
 				await caughtUp.client.shutdown();
 			}
@@ -2029,8 +2132,8 @@ describe("AHP root channel", () => {
 					behind.client.reconnect({ clientId, lastSeenServerSeq: lastSeen - 1, subscriptions: [AHP_ROOT] }),
 					"the lagging reconnect",
 				);
-				assertEquals(resumed.type, "snapshot");
-				assertEquals(resumed.type === "snapshot" ? resumed.snapshots.length : 0, 1);
+				deepStrictEqual(resumed.type, "snapshot");
+				deepStrictEqual(resumed.type === "snapshot" ? resumed.snapshots.length : 0, 1);
 			} finally {
 				await behind.client.shutdown();
 			}
@@ -2040,7 +2143,7 @@ describe("AHP root channel", () => {
 	});
 
 	it("lets MultiHostClient reconnect through a dropped link", async () => {
-		const host = boot();
+		const host = await boot();
 		const clientId = crypto.randomUUID();
 		const { multi } = await MultiHostClient.single({
 			id: "h",
@@ -2053,8 +2156,8 @@ describe("AHP root channel", () => {
 		});
 		try {
 			await until("the host to connect", () => multi.host("h")?.state.status === "connected");
-			assertEquals(multi.host("h")?.agents.length, 1);
-			assertEquals(host.calls.listSessions, 1);
+			deepStrictEqual(multi.host("h")?.agents.length, 1);
+			deepStrictEqual(host.calls.listSessions, 1);
 
 			await host.hub.dispatch(AHP_ROOT, "root/agentsChanged", { agents: [demoAgent, otherAgent] });
 			await until("the mirrored agents to grow to two", () => multi.host("h")?.agents.length === 2);
@@ -2065,7 +2168,7 @@ describe("AHP root channel", () => {
 				() => (multi.host("h")?.generation ?? 0) >= 2 && multi.host("h")?.state.status === "connected",
 				5000,
 			);
-			assertEquals(host.calls.reconnect, 1);
+			deepStrictEqual(host.calls.reconnect, 1);
 
 			await host.hub.dispatch(AHP_ROOT, "root/agentsChanged", { agents: [demoAgent] });
 			await until("the resubscribed link to see the third change", () => multi.host("h")?.agents.length === 1);
@@ -2076,11 +2179,11 @@ describe("AHP root channel", () => {
 	});
 
 	it("lists no session on a fresh host", async () => {
-		const host = boot();
+		const host = await boot();
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID());
-			assertEquals(await withTimeout(client.request("listSessions", { channel: AHP_ROOT }), "the session list"), { items: [] });
+			deepStrictEqual(await withTimeout(client.request("listSessions", { channel: AHP_ROOT }), "the session list"), { items: [] });
 		} finally {
 			await client.shutdown();
 			await host.stop();
@@ -2096,29 +2199,29 @@ describe("AHP session channel", () => {
 			IS_CLIENT_DISPATCHABLE: Record<string, boolean>;
 		};
 		for (const [name, value] of Object.entries(STATUS)) {
-			assertEquals(runtime.SessionStatus[name], value, `SessionStatus.${name}`);
+			deepStrictEqual(runtime.SessionStatus[name], value, `SessionStatus.${name}`);
 		}
 		for (const [name, value] of Object.entries(LIFECYCLE)) {
-			assertEquals(runtime.SessionLifecycle[name], value, `SessionLifecycle.${name}`);
+			deepStrictEqual(runtime.SessionLifecycle[name], value, `SessionLifecycle.${name}`);
 		}
 		for (const [name, definition] of Object.entries(session.actions)) {
-			assertEquals(definition.client, runtime.IS_CLIENT_DISPATCHABLE[name] === true, `client flag of ${name}`);
+			deepStrictEqual(definition.client, runtime.IS_CLIENT_DISPATCHABLE[name] === true, `client flag of ${name}`);
 		}
 	});
 
 	it("creates a session and announces it on root", async () => {
 		const at = "2026-09-07T12:00:00.000Z";
-		const host = boot({ now: () => at });
+		const host = await boot({ now: () => at });
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
 			const rootFeed = client.attachSubscription(AHP_ROOT);
 			const uri = sessionUri();
-			assertEquals(await withTimeout(client.request("createSession", { channel: uri, provider: "demo" }), "createSession"), null);
+			deepStrictEqual(await withTimeout(client.request("createSession", { channel: uri, provider: "demo" }), "createSession"), null);
 			const counted = await nextAction(rootFeed, "the activeSessions echo");
-			assertEquals(counted.action as unknown as Record<string, unknown>, { type: "root/activeSessionsChanged", activeSessions: 1 });
+			deepStrictEqual(counted.action as unknown as Record<string, unknown>, { type: "root/activeSessionsChanged", activeSessions: 1 });
 			const added = await nextEvent(rootFeed, "sessionAdded", "the sessionAdded notification");
-			assertEquals(added.params.summary, {
+			deepStrictEqual(added.params.summary, {
 				resource: uri,
 				provider: "demo",
 				title: "New Session",
@@ -2130,15 +2233,15 @@ describe("AHP session channel", () => {
 			const { result, subscription } = await client.subscribe(uri);
 			const snapshot = result.snapshot as Snapshot;
 			const state = snapshot.state as SessionState;
-			assertEquals(snapshot.resource, uri);
-			assertEquals(snapshot.fromSeq, host.hub.serverSeq);
-			assertEquals(state.lifecycle, LIFECYCLE.Ready);
-			assertEquals(state.chats, []);
-			assertEquals(state.activeClients, []);
+			deepStrictEqual(snapshot.resource, uri);
+			deepStrictEqual(snapshot.fromSeq, host.hub.serverSeq);
+			deepStrictEqual(state.lifecycle, LIFECYCLE.Ready);
+			deepStrictEqual(state.chats, []);
+			deepStrictEqual(state.activeClients, []);
 			const mirror = new AhpStateMirror();
 			mirror.applySnapshot(snapshot);
-			assertEquals(mirror.getSession(uri), state);
-			assertEquals(await host.hub.get(uri), state);
+			deepStrictEqual(mirror.getSession(uri), state);
+			deepStrictEqual(await host.hub.get(uri), state);
 			await subscription.close();
 		} finally {
 			await client.shutdown();
@@ -2147,7 +2250,7 @@ describe("AHP session channel", () => {
 	});
 
 	it("refuses bad creations", async () => {
-		const host = boot();
+		const host = await boot();
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -2157,22 +2260,27 @@ describe("AHP session channel", () => {
 				() => undefined,
 				(caught: unknown) => caught,
 			);
-			assertInstanceOf(twice, RpcError);
-			assertEquals(twice.code, -32003);
-			const unknownProvider = await client
-				.request("createSession", { channel: sessionUri(), provider: "nope" })
-				.then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(unknownProvider, RpcError);
-			assertEquals(unknownProvider.code, -32002);
-			const absent = await client.subscribe(sessionUri()).then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(absent, RpcError);
-			assertEquals(absent.code, -32001);
-			const disposed = await client
-				.request("disposeSession", { channel: sessionUri() })
-				.then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(disposed, RpcError);
-			assertEquals(disposed.code, -32001);
-			assertEquals((await host.hub.get(AHP_ROOT) as RootState).activeSessions, 1);
+			ok(twice instanceof RpcError);
+			deepStrictEqual(twice.code, -32003);
+			const unknownProvider = await client.request("createSession", { channel: sessionUri(), provider: "nope" }).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(unknownProvider instanceof RpcError);
+			deepStrictEqual(unknownProvider.code, -32002);
+			const absent = await client.subscribe(sessionUri()).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(absent instanceof RpcError);
+			deepStrictEqual(absent.code, -32001);
+			const disposed = await client.request("disposeSession", { channel: sessionUri() }).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(disposed instanceof RpcError);
+			deepStrictEqual(disposed.code, -32001);
+			deepStrictEqual(((await host.hub.get(AHP_ROOT)) as RootState).activeSessions, 1);
 		} finally {
 			await client.shutdown();
 			await host.stop();
@@ -2180,7 +2288,7 @@ describe("AHP session channel", () => {
 	});
 
 	it("echoes client session actions and matches the canonical reducer", async () => {
-		const host = boot({ now: ticking() });
+		const host = await boot({ now: ticking() });
 		const { client } = await connect(host.url);
 		try {
 			const clientId = crypto.randomUUID();
@@ -2190,30 +2298,28 @@ describe("AHP session channel", () => {
 			const { result, subscription } = await client.subscribe(uri);
 			const mirror = new AhpStateMirror();
 			mirror.applySnapshot(result.snapshot as Snapshot);
-			for (
-				const action of [
-					{ type: "session/titleChanged", title: "Renamed" },
-					{ type: "session/isReadChanged", isRead: true },
-					{ type: "session/isArchivedChanged", isArchived: true },
-					{ type: "session/isArchivedChanged", isArchived: false },
-					{ type: "session/workingDirectorySet", directory: "file:///tmp" },
-				]
-			) {
-				const before = await host.hub.get(uri) as SessionState;
+			for (const action of [
+				{ type: "session/titleChanged", title: "Renamed" },
+				{ type: "session/isReadChanged", isRead: true },
+				{ type: "session/isArchivedChanged", isArchived: true },
+				{ type: "session/isArchivedChanged", isArchived: false },
+				{ type: "session/workingDirectorySet", directory: "file:///tmp" },
+			]) {
+				const before = (await host.hub.get(uri)) as SessionState;
 				client.dispatch(uri, action as never);
 				const echo = await nextAction(subscription, `the echo of ${action.type}`);
-				assertEquals(echo.rejectionReason, undefined);
-				assertEquals(echo.origin?.clientId, clientId);
+				deepStrictEqual(echo.rejectionReason, undefined);
+				deepStrictEqual(echo.origin?.clientId, clientId);
 				mirror.apply(echo);
-				assertEquals(await host.hub.get(uri), ahp.sessionReducer(before, echo.action as SessionAction));
+				deepStrictEqual(await host.hub.get(uri), ahp.sessionReducer(before, echo.action as SessionAction));
 				const fresh = await client.subscribe(uri);
-				assertEquals(mirror.getSession(uri), fresh.result.snapshot?.state as SessionState);
+				deepStrictEqual(mirror.getSession(uri), fresh.result.snapshot?.state as SessionState);
 				await fresh.subscription.close();
 			}
-			const final = await host.hub.get(uri) as SessionState;
-			assertEquals(final.title, "Renamed");
-			assertEquals(final.status, STATUS.Idle | STATUS.IsRead);
-			assertEquals(final.workingDirectories, ["file:///tmp"]);
+			const final = (await host.hub.get(uri)) as SessionState;
+			deepStrictEqual(final.title, "Renamed");
+			deepStrictEqual(final.status, STATUS.Idle | STATUS.IsRead);
+			deepStrictEqual(final.workingDirectories, ["file:///tmp"]);
 			await subscription.close();
 		} finally {
 			await client.shutdown();
@@ -2222,7 +2328,7 @@ describe("AHP session channel", () => {
 	});
 
 	it("rejects a blank title and leaves both sides untouched", async () => {
-		const host = boot();
+		const host = await boot();
 		const { client } = await connect(host.url);
 		try {
 			const clientId = crypto.randomUUID();
@@ -2233,10 +2339,10 @@ describe("AHP session channel", () => {
 			const before = result.snapshot?.state as SessionState;
 			client.dispatch(uri, { type: "session/titleChanged", title: "   " } as never);
 			const echo = await nextAction(subscription, "the rejected echo");
-			assertEquals(echo.rejectionReason, "title must not be blank");
-			assertEquals(echo.origin, { clientId, clientSeq: 1 });
-			assertEquals(await host.hub.get(uri), before);
-			assertEquals(await quiet(client.events(), 250), "quiet");
+			deepStrictEqual(echo.rejectionReason, "title must not be blank");
+			deepStrictEqual(echo.origin, { clientId, clientSeq: 1 });
+			deepStrictEqual(await host.hub.get(uri), before);
+			deepStrictEqual(await quiet(client.events(), 250), "quiet");
 			await subscription.close();
 		} finally {
 			await client.shutdown();
@@ -2245,7 +2351,7 @@ describe("AHP session channel", () => {
 	});
 
 	it("propagates summary changes to the root channel", async () => {
-		const host = boot({ now: ticking() });
+		const host = await boot({ now: ticking() });
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -2254,23 +2360,22 @@ describe("AHP session channel", () => {
 			await withTimeout(client.request("createSession", { channel: uri, provider: "demo" }), "createSession");
 			client.dispatch(uri, { type: "session/titleChanged", title: "Renamed" } as never);
 			const renamed = await nextEvent(rootFeed, "sessionSummaryChanged", "the summary change after the rename");
-			assertEquals(renamed.params.session, uri);
-			assertEquals(Object.keys(renamed.params.changes).sort(), ["modifiedAt", "title"]);
-			assertEquals(renamed.params.changes.title, "Renamed");
+			deepStrictEqual(renamed.params.session, uri);
+			deepStrictEqual(Object.keys(renamed.params.changes).sort(), ["modifiedAt", "title"]);
+			deepStrictEqual(renamed.params.changes.title, "Renamed");
 			const renamedAt = renamed.params.changes.modifiedAt as string;
 
 			client.dispatch(uri, { type: "session/isArchivedChanged", isArchived: true } as never);
 			const archived = await nextEvent(rootFeed, "sessionSummaryChanged", "the summary change after the archive");
-			assertEquals(Object.keys(archived.params.changes).sort(), ["modifiedAt", "status"]);
-			assertEquals(archived.params.changes.status, STATUS.Idle | STATUS.IsArchived);
-			assert((archived.params.changes.modifiedAt as string) > renamedAt, "each change carries a fresher modifiedAt");
+			deepStrictEqual(Object.keys(archived.params.changes).sort(), ["modifiedAt", "status"]);
+			deepStrictEqual(archived.params.changes.status, STATUS.Idle | STATUS.IsArchived);
+			ok((archived.params.changes.modifiedAt as string) > renamedAt, "each change carries a fresher modifiedAt");
 
 			const listed = await withTimeout(client.request("listSessions", { channel: AHP_ROOT }), "the session list");
-			assertEquals(listed.items.map((item) => [item.title, item.status, item.modifiedAt]), [[
-				"Renamed",
-				STATUS.Idle | STATUS.IsArchived,
-				archived.params.changes.modifiedAt,
-			]]);
+			deepStrictEqual(
+				listed.items.map((item) => [item.title, item.status, item.modifiedAt]),
+				[["Renamed", STATUS.Idle | STATUS.IsArchived, archived.params.changes.modifiedAt]],
+			);
 		} finally {
 			await client.shutdown();
 			await host.stop();
@@ -2278,7 +2383,7 @@ describe("AHP session channel", () => {
 	});
 
 	it("lists sessions most-recently-modified first with paging", async () => {
-		const host = boot({ now: ticking() });
+		const host = await boot({ now: ticking() });
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -2291,16 +2396,23 @@ describe("AHP session channel", () => {
 			await nextEvent(rootFeed, "sessionSummaryChanged", "the rename to land in the catalogue");
 
 			const page = await withTimeout(client.request("listSessions", { channel: AHP_ROOT, limit: 2 }), "the first page");
-			assertEquals(page.items.map((item) => item.resource), [first, third]);
-			assertEquals(page.nextCursor, third);
+			deepStrictEqual(
+				page.items.map((item) => item.resource),
+				[first, third],
+			);
+			deepStrictEqual(page.nextCursor, third);
 			const rest = await withTimeout(client.request("listSessions", { channel: AHP_ROOT, cursor: page.nextCursor }), "the second page");
-			assertEquals(rest.items.map((item) => item.resource), [second]);
-			assertEquals(rest.nextCursor, undefined);
-			const bad = await client
-				.request("listSessions", { channel: AHP_ROOT, cursor: "garbage" })
-				.then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(bad, RpcError);
-			assertEquals(bad.code, -32602);
+			deepStrictEqual(
+				rest.items.map((item) => item.resource),
+				[second],
+			);
+			deepStrictEqual(rest.nextCursor, undefined);
+			const bad = await client.request("listSessions", { channel: AHP_ROOT, cursor: "garbage" }).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(bad instanceof RpcError);
+			deepStrictEqual(bad.code, -32602);
 		} finally {
 			await client.shutdown();
 			await host.stop();
@@ -2308,7 +2420,7 @@ describe("AHP session channel", () => {
 	});
 
 	it("disposes a session and reports it missing on reconnect", async () => {
-		const host = boot({ now: ticking() });
+		const host = await boot({ now: ticking() });
 		const clientId = crypto.randomUUID();
 		const first = await connect(host.url);
 		try {
@@ -2319,13 +2431,16 @@ describe("AHP session channel", () => {
 			await nextAction(rootFeed, "the activeSessions echo of the creation");
 			await withTimeout(first.client.request("disposeSession", { channel: uri }), "disposeSession");
 			const counted = await nextAction(rootFeed, "the activeSessions echo of the disposal");
-			assertEquals(counted.action as unknown as Record<string, unknown>, { type: "root/activeSessionsChanged", activeSessions: 0 });
+			deepStrictEqual(counted.action as unknown as Record<string, unknown>, { type: "root/activeSessionsChanged", activeSessions: 0 });
 			const removed = await nextEvent(rootFeed, "sessionRemoved", "the sessionRemoved notification");
-			assertEquals(removed.params.session, uri);
-			const gone = await first.client.subscribe(uri).then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(gone, RpcError);
-			assertEquals(gone.code, -32001);
-			assertEquals(await withTimeout(first.client.request("listSessions", { channel: AHP_ROOT }), "the empty list"), { items: [] });
+			deepStrictEqual(removed.params.session, uri);
+			const gone = await first.client.subscribe(uri).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(gone instanceof RpcError);
+			deepStrictEqual(gone.code, -32001);
+			deepStrictEqual(await withTimeout(first.client.request("listSessions", { channel: AHP_ROOT }), "the empty list"), { items: [] });
 
 			const second = await connect(host.url);
 			try {
@@ -2333,9 +2448,9 @@ describe("AHP session channel", () => {
 					second.client.reconnect({ clientId, lastSeenServerSeq: host.hub.serverSeq, subscriptions: [AHP_ROOT, uri] }),
 					"the reconnect result",
 				);
-				assertEquals(resumed.type, "replay");
-				assert(resumed.type === "replay");
-				assertEquals(resumed.missing, [uri]);
+				deepStrictEqual(resumed.type, "replay");
+				ok(resumed.type === "replay");
+				deepStrictEqual(resumed.missing, [uri]);
 			} finally {
 				await second.client.shutdown();
 			}
@@ -2346,7 +2461,7 @@ describe("AHP session channel", () => {
 	});
 
 	it("keeps MultiHostClient's session cache in sync", async () => {
-		const host = boot({ now: ticking() });
+		const host = await boot({ now: ticking() });
 		const clientId = crypto.randomUUID();
 		const { multi } = await MultiHostClient.single({
 			id: "h",
@@ -2362,11 +2477,10 @@ describe("AHP session channel", () => {
 			const first = sessionUri();
 			await withTimeout(hostClient(multi, "h").request("createSession", { channel: first, provider: "demo" }), "the first createSession");
 			await until("the aggregated cache to hold the session", () => multi.aggregatedSessions().length === 1);
-			assertEquals(multi.aggregatedSessions().map((entry) => [entry.hostId, entry.summary.resource, entry.summary.title]), [[
-				"h",
-				first,
-				"New Session",
-			]]);
+			deepStrictEqual(
+				multi.aggregatedSessions().map((entry) => [entry.hostId, entry.summary.resource, entry.summary.title]),
+				[["h", first, "New Session"]],
+			);
 			await withTimeout(hostClient(multi, "h").request("disposeSession", { channel: first }), "disposeSession");
 			await until("the aggregated cache to empty", () => multi.aggregatedSessions().length === 0);
 
@@ -2379,20 +2493,23 @@ describe("AHP session channel", () => {
 				() => (multi.host("h")?.generation ?? 0) >= 2 && multi.host("h")?.state.status === "connected",
 				5000,
 			);
-			assertEquals(multi.aggregatedSessions().map((entry) => entry.summary.resource), [second]);
-			assertEquals(host.calls.listSessions, 2);
+			deepStrictEqual(
+				multi.aggregatedSessions().map((entry) => entry.summary.resource),
+				[second],
+			);
+			deepStrictEqual(host.calls.listSessions, 2);
 		} finally {
 			await multi.shutdown();
 			await host.stop();
 		}
 	});
 
-	it("runs the whole lifecycle on Deno KV storage", async () => {
-		using storage = await DenoKvStorage.open(":memory:");
+	it("runs the whole lifecycle on SQLite storage", async () => {
+		using storage = await SqliteStorage.open(":memory:");
 		const now = ticking();
 		const kept = sessionUri();
 		const dropped = sessionUri();
-		const first = boot({ storage, now });
+		const first = await boot({ storage, now });
 		let lastSeen = 0;
 		try {
 			const { client } = await connect(first.url);
@@ -2404,7 +2521,7 @@ describe("AHP session channel", () => {
 				}
 				client.dispatch(kept, { type: "session/titleChanged", title: "Persisted" } as never);
 				const renamed = await nextEvent(rootFeed, "sessionSummaryChanged", "the rename to reach the catalogue");
-				assertEquals(renamed.params.changes.title, "Persisted");
+				deepStrictEqual(renamed.params.changes.title, "Persisted");
 				await withTimeout(client.request("disposeSession", { channel: dropped }), "disposeSession");
 				lastSeen = first.hub.serverSeq;
 			} finally {
@@ -2414,22 +2531,25 @@ describe("AHP session channel", () => {
 			await first.stop();
 		}
 
-		const second = boot({ storage, now });
+		const second = await boot({ storage, now });
 		try {
 			await second.hub.ready();
-			assertEquals(second.hub.serverSeq, lastSeen);
-			assertEquals((await second.hub.get(AHP_ROOT) as RootState).activeSessions, 1);
+			deepStrictEqual(second.hub.serverSeq, lastSeen);
+			deepStrictEqual(((await second.hub.get(AHP_ROOT)) as RootState).activeSessions, 1);
 			const { client } = await connect(second.url);
 			try {
 				await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
 				const listed = await withTimeout(client.request("listSessions", { channel: AHP_ROOT }), "the session list after the restart");
-				assertEquals(listed.items.map((item) => [item.resource, item.title]), [[kept, "Persisted"]]);
+				deepStrictEqual(
+					listed.items.map((item) => [item.resource, item.title]),
+					[[kept, "Persisted"]],
+				);
 				await withTimeout(
 					client.request("createSession", { channel: sessionUri(), provider: "demo" }),
 					"a createSession after the restart",
 				);
-				assert(second.hub.serverSeq > lastSeen, "the sequence keeps climbing across a restart");
-				assertEquals((await withTimeout(client.request("listSessions", { channel: AHP_ROOT }), "the grown list")).items.length, 2);
+				ok(second.hub.serverSeq > lastSeen, "the sequence keeps climbing across a restart");
+				deepStrictEqual((await withTimeout(client.request("listSessions", { channel: AHP_ROOT }), "the grown list")).items.length, 2);
 			} finally {
 				await client.shutdown();
 			}
@@ -2449,7 +2569,7 @@ describe("AHP chat channel", () => {
 	}
 
 	async function createChat(client: AhpClient, session: string, chat: string): Promise<void> {
-		assertEquals(await withTimeout(client.request("createChat", { channel: session, chat }), `createChat for ${chat}`), null);
+		deepStrictEqual(await withTimeout(client.request("createChat", { channel: session, chat }), `createChat for ${chat}`), null);
 	}
 
 	/** Starts a turn and returns every echo up to and including the agent's `chat/turnComplete`. */
@@ -2461,16 +2581,16 @@ describe("AHP chat channel", () => {
 	it("pins the chat constants and the client-dispatchable table", () => {
 		const runtime = ahp as unknown as { TurnState: Record<string, unknown>; IS_CLIENT_DISPATCHABLE: Record<string, boolean> };
 		for (const [name, value] of Object.entries(TURN)) {
-			assertEquals(runtime.TurnState[name], value, `TurnState.${name}`);
+			deepStrictEqual(runtime.TurnState[name], value, `TurnState.${name}`);
 		}
 		for (const [name, definition] of Object.entries(chat.actions)) {
-			assertEquals(definition.client, runtime.IS_CLIENT_DISPATCHABLE[name] === true, `client flag of ${name}`);
+			deepStrictEqual(definition.client, runtime.IS_CLIENT_DISPATCHABLE[name] === true, `client flag of ${name}`);
 		}
 	});
 
 	it("creates a chat inside a ready session", async () => {
 		const at = "2026-09-07T12:00:00.000Z";
-		const host = boot({ now: () => at });
+		const host = await boot({ now: () => at });
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -2479,23 +2599,23 @@ describe("AHP chat channel", () => {
 			await createChat(client, session, uri);
 
 			const added = await nextAction(feed, "the chatAdded echo");
-			assertEquals(added.action as unknown as Record<string, unknown>, {
+			deepStrictEqual(added.action as unknown as Record<string, unknown>, {
 				type: "session/chatAdded",
 				summary: { resource: uri, title: "New Chat", status: STATUS.Idle, modifiedAt: at },
 			});
 			const defaulted = await nextAction(feed, "the defaultChatChanged echo");
-			assertEquals(defaulted.action as unknown as Record<string, unknown>, { type: "session/defaultChatChanged", defaultChat: uri });
+			deepStrictEqual(defaulted.action as unknown as Record<string, unknown>, { type: "session/defaultChatChanged", defaultChat: uri });
 
 			const { result, subscription } = await client.subscribe(uri);
-			assertEquals(result.snapshot?.state, { resource: uri, title: "New Chat", status: STATUS.Idle, modifiedAt: at, turns: [] });
-			assertEquals(result.snapshot?.fromSeq, host.hub.serverSeq);
+			deepStrictEqual(result.snapshot?.state, { resource: uri, title: "New Chat", status: STATUS.Idle, modifiedAt: at, turns: [] });
+			deepStrictEqual(result.snapshot?.fromSeq, host.hub.serverSeq);
 
 			const mirror = new AhpStateMirror();
 			mirror.applySnapshot(snapshot);
 			mirror.apply(added);
 			mirror.apply(defaulted);
-			assertEquals(mirror.getSession(session)?.chats.length, 1);
-			assertEquals(mirror.getSession(session), wire(await host.hub.get(session)) as SessionState);
+			deepStrictEqual(mirror.getSession(session)?.chats.length, 1);
+			deepStrictEqual(mirror.getSession(session), wire(await host.hub.get(session)) as SessionState);
 			await subscription.close();
 		} finally {
 			await client.shutdown();
@@ -2504,7 +2624,7 @@ describe("AHP chat channel", () => {
 	});
 
 	it("refuses chats on unknown, duplicate or unready targets", async () => {
-		const host = boot();
+		const host = await boot();
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -2512,36 +2632,48 @@ describe("AHP chat channel", () => {
 			const uri = chatUri();
 			await createChat(client, session, uri);
 
-			const unknownSession = await client
-				.request("createChat", { channel: sessionUri(), chat: chatUri() })
-				.then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(unknownSession, RpcError);
-			assertEquals(unknownSession.code, -32001);
-			const twice = await client.request("createChat", { channel: session, chat: uri }).then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(twice, RpcError);
-			assertEquals(twice.code, -32010);
-			const absent = await client.subscribe(chatUri()).then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(absent, RpcError);
-			assertEquals(absent.code, -32008);
-			const gone = await client.request("disposeChat", { channel: chatUri() }).then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(gone, RpcError);
-			assertEquals(gone.code, -32008);
-			const badCursor = await client
-				.request("fetchTurns", { channel: uri, cursor: "garbage" })
-				.then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(badCursor, RpcError);
-			assertEquals(badCursor.code, -32602);
-			assertEquals(await withTimeout(client.request("fetchTurns", { channel: uri }), "a cursorless fetchTurns"), {});
+			const unknownSession = await client.request("createChat", { channel: sessionUri(), chat: chatUri() }).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(unknownSession instanceof RpcError);
+			deepStrictEqual(unknownSession.code, -32001);
+			const twice = await client.request("createChat", { channel: session, chat: uri }).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(twice instanceof RpcError);
+			deepStrictEqual(twice.code, -32010);
+			const absent = await client.subscribe(chatUri()).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(absent instanceof RpcError);
+			deepStrictEqual(absent.code, -32008);
+			const gone = await client.request("disposeChat", { channel: chatUri() }).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(gone instanceof RpcError);
+			deepStrictEqual(gone.code, -32008);
+			const badCursor = await client.request("fetchTurns", { channel: uri, cursor: "garbage" }).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(badCursor instanceof RpcError);
+			deepStrictEqual(badCursor.code, -32602);
+			deepStrictEqual(await withTimeout(client.request("fetchTurns", { channel: uri }), "a cursorless fetchTurns"), {});
 
 			// `-32011` never reaches the wire, because `createSession` dispatches `session/ready` itself:
 			// a session a client can name is always ready. The refusal is still there underneath.
 			const creating = sessionUri();
 			await host.hub.create(creating, { ...initialSessionState });
-			const conflict = await host.hub
-				.exec(creating, "createChat", { chat: chatUri() })
-				.then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(conflict, AhpError);
-			assertEquals(conflict.code, -32011);
+			const conflict = await host.hub.exec(creating, "createChat", { chat: chatUri() }).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(conflict instanceof AhpError);
+			deepStrictEqual(conflict.code, -32011);
 		} finally {
 			await client.shutdown();
 			await host.stop();
@@ -2549,7 +2681,7 @@ describe("AHP chat channel", () => {
 	});
 
 	it("streams a full turn and matches chatReducer step by step", async () => {
-		const host = boot();
+		const host = await boot();
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -2560,7 +2692,7 @@ describe("AHP chat channel", () => {
 			const startedAt = new Date().toISOString();
 			client.dispatch(uri, { type: "chat/turnStarted", turnId: "t1", startedAt, message: message("hi") } as never);
 			const echoes = await actionsUntil(subscription, (envelope) => typeOf(envelope) === "chat/turnComplete", "the turn to complete");
-			assertEquals(echoes.map(typeOf), [
+			deepStrictEqual(echoes.map(typeOf), [
 				"chat/turnStarted",
 				"chat/activityChanged",
 				"chat/responsePart",
@@ -2574,21 +2706,21 @@ describe("AHP chat channel", () => {
 
 			let folded = result.snapshot?.state as ChatState;
 			for (const echo of echoes) {
-				assertEquals(echo.rejectionReason, undefined);
+				deepStrictEqual(echo.rejectionReason, undefined);
 				folded = ahp.chatReducer(folded, echo.action as ChatAction);
 			}
 			const fresh = await client.subscribe(uri);
-			assertEquals(wire(folded), fresh.result.snapshot?.state);
-			const state = await host.hub.get(uri) as ChatState;
-			assertEquals(wire(state), fresh.result.snapshot?.state);
-			assertEquals(state.turns.length, 1);
-			assertEquals(state.turns[0].responseParts as unknown, [{ kind: "markdown", id: "p1", content: "Hello, world" }]);
-			assertEquals(state.turns[0].state, TURN.Complete);
-			assertEquals(state.turns[0].duration, TURN_DURATION_MS);
-			assertEquals(state.turns[0].usage?.outputTokens, 3);
-			assertEquals(state.status, STATUS.Idle);
-			assertEquals(state.activeTurn, undefined);
-			assertEquals(state.modifiedAt, stampAfter(startedAt, TURN_DURATION_MS));
+			deepStrictEqual(wire(folded), fresh.result.snapshot?.state);
+			const state = (await host.hub.get(uri)) as ChatState;
+			deepStrictEqual(wire(state), fresh.result.snapshot?.state);
+			deepStrictEqual(state.turns.length, 1);
+			deepStrictEqual(state.turns[0].responseParts as unknown, [{ kind: "markdown", id: "p1", content: "Hello, world" }]);
+			deepStrictEqual(state.turns[0].state, TURN.Complete);
+			deepStrictEqual(state.turns[0].duration, TURN_DURATION_MS);
+			deepStrictEqual(state.turns[0].usage?.outputTokens, 3);
+			deepStrictEqual(state.status, STATUS.Idle);
+			deepStrictEqual(state.activeTurn, undefined);
+			deepStrictEqual(state.modifiedAt, stampAfter(startedAt, TURN_DURATION_MS));
 			await fresh.subscription.close();
 			await subscription.close();
 		} finally {
@@ -2598,7 +2730,7 @@ describe("AHP chat channel", () => {
 	});
 
 	it("mirrors turn progress on the session and the root", async () => {
-		const host = boot({ now: ticking() });
+		const host = await boot({ now: ticking() });
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -2610,10 +2742,12 @@ describe("AHP chat channel", () => {
 			mirror.applySnapshot(snapshot);
 			const { subscription } = await client.subscribe(uri);
 
-			client.dispatch(
-				uri,
-				{ type: "chat/turnStarted", turnId: "t1", startedAt: new Date().toISOString(), message: message("hi") } as never,
-			);
+			client.dispatch(uri, {
+				type: "chat/turnStarted",
+				turnId: "t1",
+				startedAt: new Date().toISOString(),
+				message: message("hi"),
+			} as never);
 			const echoes = await actionsUntil(
 				feed,
 				(envelope) => typeOf(envelope) === "session/chatUpdated" && changesOf(envelope).status === STATUS.Idle,
@@ -2621,29 +2755,29 @@ describe("AHP chat channel", () => {
 			);
 			const statuses: number[] = [];
 			for (const echo of echoes) {
-				assertEquals(echo.rejectionReason, undefined);
-				assertEquals("resource" in changesOf(echo), false);
+				deepStrictEqual(echo.rejectionReason, undefined);
+				deepStrictEqual("resource" in changesOf(echo), false);
 				mirror.apply(echo);
 				const status = changesOf(echo).status;
 				if (typeof status === "number" && typeOf(echo) === "session/chatUpdated") {
 					statuses.push(status);
 				}
 			}
-			assertEquals(statuses, [STATUS.InProgress, STATUS.Idle]);
+			deepStrictEqual(statuses, [STATUS.InProgress, STATUS.Idle]);
 
 			const seen: number[] = [];
 			for (;;) {
 				const changed = await nextEvent(rootFeed, "sessionSummaryChanged", "a session summary change");
-				assertEquals(changed.params.session, session);
-				assertEquals("resource" in changed.params.changes, false);
+				deepStrictEqual(changed.params.session, session);
+				deepStrictEqual("resource" in changed.params.changes, false);
 				seen.push(changed.params.changes.status as number);
 				if (seen.includes(STATUS.InProgress) && seen.at(-1) === STATUS.Idle) {
 					break;
 				}
 			}
-			assertEquals(mirror.getSession(session), wire(await host.hub.get(session)) as SessionState);
+			deepStrictEqual(mirror.getSession(session), wire(await host.hub.get(session)) as SessionState);
 			const refreshed = await client.subscribe(session);
-			assertEquals(mirror.getSession(session), refreshed.result.snapshot?.state as SessionState);
+			deepStrictEqual(mirror.getSession(session), refreshed.result.snapshot?.state as SessionState);
 			await refreshed.subscription.close();
 			await subscription.close();
 		} finally {
@@ -2653,7 +2787,7 @@ describe("AHP chat channel", () => {
 	});
 
 	it("rejects a second turn while one is active", async () => {
-		const host = boot();
+		const host = await boot();
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -2667,11 +2801,14 @@ describe("AHP chat channel", () => {
 			const echoes = await actionsUntil(subscription, (envelope) => typeOf(envelope) === "chat/turnComplete", "the first turn to complete");
 
 			const refused = echoes.filter((envelope) => envelope.rejectionReason !== undefined);
-			assertEquals(refused.map(typeOf), ["chat/turnStarted"]);
-			assert(refused[0].rejectionReason?.startsWith("TURN_IN_PROGRESS"), `unexpected reason ${refused[0].rejectionReason}`);
-			const state = await host.hub.get(uri) as ChatState;
-			assertEquals(state.turns.map((turn) => turn.id), ["t1"]);
-			assertEquals(state.status, STATUS.Idle);
+			deepStrictEqual(refused.map(typeOf), ["chat/turnStarted"]);
+			ok(refused[0].rejectionReason?.startsWith("TURN_IN_PROGRESS"), `unexpected reason ${refused[0].rejectionReason}`);
+			const state = (await host.hub.get(uri)) as ChatState;
+			deepStrictEqual(
+				state.turns.map((turn) => turn.id),
+				["t1"],
+			);
+			deepStrictEqual(state.status, STATUS.Idle);
 			await subscription.close();
 		} finally {
 			await client.shutdown();
@@ -2681,7 +2818,7 @@ describe("AHP chat channel", () => {
 
 	it("cancels an active turn", async () => {
 		const clock = pausedTicks();
-		const host = boot({ tick: clock.tick });
+		const host = await boot({ tick: clock.tick });
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -2689,33 +2826,35 @@ describe("AHP chat channel", () => {
 			const uri = chatUri();
 			await createChat(client, session, uri);
 			const { result, subscription } = await client.subscribe(uri);
-			client.dispatch(
-				uri,
-				{ type: "chat/turnStarted", turnId: "t1", startedAt: new Date().toISOString(), message: message("hi") } as never,
-			);
+			client.dispatch(uri, {
+				type: "chat/turnStarted",
+				turnId: "t1",
+				startedAt: new Date().toISOString(),
+				message: message("hi"),
+			} as never);
 			const echoes = await actionsUntil(subscription, (envelope) => typeOf(envelope) === "chat/responsePart", "the empty markdown part");
 			await clock.release();
 			echoes.push(await nextAction(subscription, "the first delta"));
-			assertEquals(typeOf(echoes[echoes.length - 1]), "chat/delta");
+			deepStrictEqual(typeOf(echoes[echoes.length - 1]), "chat/delta");
 
 			client.dispatch(uri, { type: "chat/turnCancelled", turnId: "t1", duration: 7 } as never);
 			echoes.push(await nextAction(subscription, "the cancellation echo"));
-			assertEquals(typeOf(echoes[echoes.length - 1]), "chat/turnCancelled");
+			deepStrictEqual(typeOf(echoes[echoes.length - 1]), "chat/turnCancelled");
 			clock.releaseAll();
-			assertEquals(await quiet(client.events(), 250), "quiet");
+			deepStrictEqual(await quiet(client.events(), 250), "quiet");
 
-			const state = await host.hub.get(uri) as ChatState;
-			assertEquals(state.turns.length, 1);
-			assertEquals(state.turns[0].state, TURN.Cancelled);
-			assertEquals(state.turns[0].duration, 7);
-			assertEquals(state.turns[0].responseParts as unknown, [{ kind: "markdown", id: "p1", content: "Hello" }]);
-			assertEquals(state.status, STATUS.Idle);
-			assertEquals(state.activeTurn, undefined);
+			const state = (await host.hub.get(uri)) as ChatState;
+			deepStrictEqual(state.turns.length, 1);
+			deepStrictEqual(state.turns[0].state, TURN.Cancelled);
+			deepStrictEqual(state.turns[0].duration, 7);
+			deepStrictEqual(state.turns[0].responseParts as unknown, [{ kind: "markdown", id: "p1", content: "Hello" }]);
+			deepStrictEqual(state.status, STATUS.Idle);
+			deepStrictEqual(state.activeTurn, undefined);
 			let folded = result.snapshot?.state as ChatState;
 			for (const echo of echoes) {
 				folded = ahp.chatReducer(folded, echo.action as ChatAction);
 			}
-			assertEquals(wire(folded), wire(state));
+			deepStrictEqual(wire(folded), wire(state));
 			await subscription.close();
 		} finally {
 			clock.releaseAll();
@@ -2725,7 +2864,7 @@ describe("AHP chat channel", () => {
 	});
 
 	it("persists the draft a client is composing", async () => {
-		const host = boot();
+		const host = await boot();
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -2736,16 +2875,16 @@ describe("AHP chat channel", () => {
 
 			client.dispatch(uri, { type: "chat/draftChanged", draft: message("wip") } as never);
 			const saved = await nextAction(subscription, "the draft echo");
-			assertEquals(saved.rejectionReason, undefined);
+			deepStrictEqual(saved.rejectionReason, undefined);
 			const withDraft = await client.subscribe(uri);
-			assertEquals((withDraft.result.snapshot?.state as ChatState).draft, message("wip"));
+			deepStrictEqual((withDraft.result.snapshot!.state as ChatState).draft, message("wip"));
 			await withDraft.subscription.close();
 
 			client.dispatch(uri, { type: "chat/draftChanged" } as never);
 			const cleared = await nextAction(subscription, "the cleared draft echo");
-			assertEquals(cleared.rejectionReason, undefined);
+			deepStrictEqual(cleared.rejectionReason, undefined);
 			const withoutDraft = await client.subscribe(uri);
-			assertEquals("draft" in (withoutDraft.result.snapshot?.state as object), false);
+			deepStrictEqual("draft" in (withoutDraft.result.snapshot!.state as object), false);
 			await withoutDraft.subscription.close();
 			await subscription.close();
 		} finally {
@@ -2755,7 +2894,7 @@ describe("AHP chat channel", () => {
 	});
 
 	it("disposes chats with their session", async () => {
-		const host = boot({ now: ticking() });
+		const host = await boot({ now: ticking() });
 		const clientId = crypto.randomUUID();
 		const { client } = await connect(host.url);
 		try {
@@ -2765,36 +2904,41 @@ describe("AHP chat channel", () => {
 			mirror.applySnapshot(snapshot);
 			const first = chatUri();
 			await createChat(client, session, first);
-			for (
-				const echo of await actionsUntil(feed, (envelope) => typeOf(envelope) === "session/defaultChatChanged", "the chat to be announced")
-			) {
+			for (const echo of await actionsUntil(
+				feed,
+				(envelope) => typeOf(envelope) === "session/defaultChatChanged",
+				"the chat to be announced",
+			)) {
 				mirror.apply(echo);
 			}
-			assertEquals(mirror.getSession(session)?.defaultChat, first);
+			deepStrictEqual(mirror.getSession(session)?.defaultChat, first);
 
 			await withTimeout(client.request("disposeChat", { channel: first }), "disposeChat");
 			for (const echo of await actionsUntil(feed, (envelope) => typeOf(envelope) === "session/chatRemoved", "the chatRemoved echo")) {
 				mirror.apply(echo);
 			}
-			assertEquals(mirror.getSession(session)?.chats, []);
-			assertEquals(mirror.getSession(session)?.defaultChat, undefined);
-			const gone = await client.subscribe(first).then(() => undefined, (caught: unknown) => caught);
-			assertInstanceOf(gone, RpcError);
-			assertEquals(gone.code, -32008);
+			deepStrictEqual(mirror.getSession(session)?.chats, []);
+			deepStrictEqual(mirror.getSession(session)?.defaultChat, undefined);
+			const gone = await client.subscribe(first).then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+			ok(gone instanceof RpcError);
+			deepStrictEqual(gone.code, -32008);
 
 			const second = chatUri();
 			const third = chatUri();
 			await createChat(client, session, second);
 			await createChat(client, session, third);
 			await withTimeout(client.request("disposeSession", { channel: session }), "disposeSession");
-			assertEquals(await host.hub.has(second), false);
-			assertEquals(await host.hub.has(third), false);
+			deepStrictEqual(await host.hub.has(second), false);
+			deepStrictEqual(await host.hub.has(third), false);
 			const resumed = await withTimeout(
 				client.reconnect({ clientId, lastSeenServerSeq: host.hub.serverSeq, subscriptions: [AHP_ROOT, session, second, third] }),
 				"the reconnect after the disposal",
 			);
-			assert(resumed.type === "replay");
-			assertEquals(resumed.missing, [session, second, third]);
+			ok(resumed.type === "replay");
+			deepStrictEqual(resumed.missing, [session, second, third]);
 		} finally {
 			await client.shutdown();
 			await host.stop();
@@ -2803,7 +2947,7 @@ describe("AHP chat channel", () => {
 
 	it("replays a turn to a reconnecting client, and snapshots it when the ring is too small", async () => {
 		for (const replayLimit of [undefined, 3]) {
-			const host = boot(replayLimit === undefined ? {} : { replayLimit });
+			const host = await boot(replayLimit === undefined ? {} : { replayLimit });
 			const clientId = crypto.randomUUID();
 			const away = await connect(host.url);
 			try {
@@ -2836,19 +2980,22 @@ describe("AHP chat channel", () => {
 					const fresh = await back.client.subscribe(uri);
 					const current = fresh.result.snapshot?.state as ChatState;
 					if (replayLimit === undefined) {
-						assert(resumed.type === "replay", `expected a replay, got ${resumed.type}`);
+						ok(resumed.type === "replay", `expected a replay, got ${resumed.type}`);
 						let folded = baseline;
 						for (const envelope of resumed.actions) {
-							assertEquals(envelope.channel, uri);
+							deepStrictEqual(envelope.channel, uri);
 							folded = ahp.chatReducer(folded, envelope.action as ChatAction);
 						}
-						assertEquals(wire(folded), current);
+						deepStrictEqual(wire(folded), current);
 					} else {
-						assert(resumed.type === "snapshot", `expected a snapshot, got ${resumed.type}`);
-						assertEquals(resumed.snapshots.map((snapshot) => snapshot.resource), [uri]);
-						assertEquals(resumed.snapshots[0].state, current);
+						ok(resumed.type === "snapshot", `expected a snapshot, got ${resumed.type}`);
+						deepStrictEqual(
+							resumed.snapshots.map((snapshot) => snapshot.resource),
+							[uri],
+						);
+						deepStrictEqual(resumed.snapshots[0].state, current);
 					}
-					assertEquals((current.turns[0].responseParts[0] as { content: string }).content, "Hello, world");
+					deepStrictEqual((current.turns[0].responseParts[0] as { content: string }).content, "Hello, world");
 					await fresh.subscription.close();
 				} finally {
 					await back.client.shutdown();
@@ -2860,7 +3007,7 @@ describe("AHP chat channel", () => {
 	});
 
 	it("keeps AhpStateMirror unaware of chats but consistent for sessions", async () => {
-		const host = boot({ now: ticking() });
+		const host = await boot({ now: ticking() });
 		const { client } = await connect(host.url);
 		try {
 			await handshake(client, crypto.randomUUID(), [AHP_ROOT]);
@@ -2872,21 +3019,21 @@ describe("AHP chat channel", () => {
 			mirror.applySnapshot(snapshot);
 			// A chat snapshot goes nowhere: the mirror has no chat branch at all.
 			mirror.applySnapshot(result.snapshot as Snapshot);
-			assertEquals(mirror.sessions.size, 1);
+			deepStrictEqual(mirror.sessions.size, 1);
 
 			const echoes = await runTurn(client, uri, subscription, "t1");
 			for (const echo of echoes) {
 				mirror.apply(echo);
 			}
-			assertEquals(mirror.sessions.size, 1);
-			assertEquals(mirror.getSession(session), snapshot.state as SessionState);
-			assertNotEquals(wire(await host.hub.get(session)) as SessionState, mirror.getSession(session));
+			deepStrictEqual(mirror.sessions.size, 1);
+			deepStrictEqual(mirror.getSession(session), snapshot.state as SessionState);
+			notDeepStrictEqual(wire(await host.hub.get(session)) as SessionState, mirror.getSession(session));
 
 			let folded = result.snapshot?.state as ChatState;
 			for (const echo of echoes) {
 				folded = ahp.chatReducer(folded, echo.action as ChatAction);
 			}
-			assertEquals(wire(folded), wire(await host.hub.get(uri)));
+			deepStrictEqual(wire(folded), wire(await host.hub.get(uri)));
 			await subscription.close();
 		} finally {
 			await client.shutdown();

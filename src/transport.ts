@@ -112,7 +112,7 @@ export interface WebSocketCloseInfo {
 }
 
 /**
- * A transport over the global `WebSocket`, so it runs in a browser, in Deno and in Node without a
+ * A transport over the global `WebSocket`, so it runs in a browser and in Node without a
  * dependency. Messages are one JSON text frame each; a binary frame is decoded as UTF-8 text.
  *
  * A clean close ends `recv()` with `null`. An unclean close, a socket error and an undecodable frame

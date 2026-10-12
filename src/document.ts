@@ -10,8 +10,9 @@
  * Schema equivalent — `v.custom`, for one — becomes `{}`, so a definition carrying opaque parts still
  * documents cleanly.
  */
-import { type GenericSchema, minLength, pipe, string } from "valibot";
+
 import { type JsonSchema, toJsonSchema } from "@valibot/to-json-schema";
+import { type GenericSchema, minLength, pipe, string } from "valibot";
 import type { DurableChannelPrincipal } from "./channel.ts";
 import { type DurableChannelRoute, type DurableChannelRouteMap, type DurableChannelRoutes, isSingleton } from "./routes.ts";
 

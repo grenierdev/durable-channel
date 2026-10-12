@@ -24,7 +24,8 @@ import { InvalidDefinitionError } from "./error.ts";
 /** The parameter names of a template, as an object type. A singleton template yields `{}`. */
 export type PathToParams<TTemplate extends string> = { [K in ParamNames<TTemplate>]: string };
 
-type ParamNames<TTemplate extends string> = TTemplate extends `${infer Head}/${infer Rest}` ? SegmentName<Head> | ParamNames<Rest>
+type ParamNames<TTemplate extends string> = TTemplate extends `${infer Head}/${infer Rest}`
+	? SegmentName<Head> | ParamNames<Rest>
 	: SegmentName<TTemplate>;
 
 type SegmentName<TSegment extends string> = TSegment extends `:${infer Name}` ? Name : never;
@@ -41,9 +42,15 @@ export interface DurableChannelRouteTypes {
 export type DurableChannelRouteMap = Record<string, DurableChannelRouteTypes>;
 
 /** `true` when one segment of a template accepts one segment of a URI. */
-type SegmentMatches<TSegment extends string, TValue extends string> = TSegment extends `:${string}` ? TValue extends "" ? false : true
-	: [TSegment] extends [TValue] ? [TValue] extends [TSegment] ? true : false
-	: false;
+type SegmentMatches<TSegment extends string, TValue extends string> = TSegment extends `:${string}`
+	? TValue extends ""
+		? false
+		: true
+	: [TSegment] extends [TValue]
+		? [TValue] extends [TSegment]
+			? true
+			: false
+		: false;
 
 /**
  * The type-level twin of {@link matchRoute} for one template: `true` when the URI literal matches it.
@@ -51,10 +58,14 @@ type SegmentMatches<TSegment extends string, TValue extends string> = TSegment e
  * fall back to `unknown` instead of guessing.
  */
 export type UriMatchesTemplate<TTemplate extends string, TUri extends string> = TTemplate extends `${infer THead}/${infer TRest}`
-	? TUri extends `${infer UHead}/${infer URest}` ? SegmentMatches<THead, UHead> extends true ? UriMatchesTemplate<TRest, URest> : false
-	: false
-	: TUri extends `${string}/${string}` ? false
-	: SegmentMatches<TTemplate, TUri>;
+	? TUri extends `${infer UHead}/${infer URest}`
+		? SegmentMatches<THead, UHead> extends true
+			? UriMatchesTemplate<TRest, URest>
+			: false
+		: false
+	: TUri extends `${string}/${string}`
+		? false
+		: SegmentMatches<TTemplate, TUri>;
 
 /** The route types a URI literal resolves to, or `never` when no template in the map matches it. */
 export type MatchRoute<TRoutes extends DurableChannelRouteMap, TUri extends string> = {
@@ -104,7 +115,7 @@ export interface DurableChannelRouteMatch<TEnv = unknown, TPrincipal extends Dur
 /** A built route map. `TRoutes` is a phantom parameter carrying every route's types. */
 export interface DurableChannelRoutes<
 	TEnv = unknown,
-	TRoutes extends DurableChannelRouteMap = DurableChannelRouteMap,
+	_TRoutes extends DurableChannelRouteMap = DurableChannelRouteMap,
 	TPrincipal extends DurableChannelPrincipal = DurableChannelPrincipal,
 > {
 	readonly routes: readonly DurableChannelRoute<TEnv, TPrincipal>[];
@@ -206,8 +217,7 @@ export class DurableChannelRoutesBuilder<
 		options?: DurableChannelRouteOptions,
 	): DurableChannelRoutesBuilder<
 		TEnv,
-		& TRoutes
-		& {
+		TRoutes & {
 			[K in TTemplate]: { state: TState; actions: TActions; commands: TCommands; notifications: TNotifications };
 		},
 		TPrincipal

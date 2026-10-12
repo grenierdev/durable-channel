@@ -1,5 +1,5 @@
-import { describe, it } from "node:test";
-import { assert, assertEquals, assertInstanceOf } from "@std/assert";
+import { deepStrictEqual, ok } from "node:assert/strict";
+import { describe, it } from "vitest";
 import {
 	AuthenticationRequiredError,
 	ChannelAlreadyExistsError,
@@ -40,21 +40,24 @@ describe("error", () => {
 	];
 
 	it("gives every class a stable code and its own name", () => {
-		assertEquals(instances.map(([error]) => error.code), instances.map(([, code]) => code));
-		assertEquals(new ChannelNotFoundError("doc:/1").name, "ChannelNotFoundError");
+		deepStrictEqual(
+			instances.map(([error]) => error.code),
+			instances.map(([, code]) => code),
+		);
+		deepStrictEqual(new ChannelNotFoundError("doc:/1").name, "ChannelNotFoundError");
 	});
 
 	it("makes every failure catchable as a DurableChannelError", () => {
 		for (const [error] of instances) {
-			assertInstanceOf(error, DurableChannelError);
-			assertInstanceOf(error, Error);
+			ok(error instanceof DurableChannelError);
+			ok(error instanceof Error);
 		}
 	});
 
 	it("keeps RejectAction outside the taxonomy", () => {
 		const rejection = new RejectAction("by must be positive");
-		assert(!(rejection instanceof DurableChannelError), "a rejection is a domain signal, not a library failure");
-		assertEquals(rejection.reason, "by must be positive");
-		assertEquals(rejection.message, "by must be positive");
+		ok(!(rejection instanceof DurableChannelError), "a rejection is a domain signal, not a library failure");
+		deepStrictEqual(rejection.reason, "by must be positive");
+		deepStrictEqual(rejection.message, "by must be positive");
 	});
 });

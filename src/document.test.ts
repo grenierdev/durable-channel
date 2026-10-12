@@ -1,9 +1,9 @@
-import { describe, it } from "node:test";
-import { assertEquals } from "@std/assert";
+import { deepStrictEqual } from "node:assert/strict";
 import * as v from "valibot";
+import { describe, it } from "vitest";
 import { durableChannel } from "./channel.ts";
+import { DURABLE_CHANNEL_DOCUMENT_VERSION, describeRoutes } from "./document.ts";
 import { durableRoutes } from "./routes.ts";
-import { describeRoutes, DURABLE_CHANNEL_DOCUMENT_VERSION } from "./document.ts";
 
 const DRAFT = "http://json-schema.org/draft-07/schema#";
 
@@ -12,46 +12,71 @@ const counter = durableChannel()
 	.summary("A number everyone can bump")
 	.state(v.object({ count: v.number(), updatedAt: v.optional(v.string()) }), { count: 0 })
 	.action((a) =>
-		a.name("counter/incremented")
+		a
+			.name("counter/incremented")
 			.summary("Adds `by` to the count")
 			.payload(v.object({ by: v.pipe(v.number(), v.integer()) }))
 			.client()
-			.reduce((state, payload) => ({ ...state, count: state.count + payload.by }))
+			.reduce((state, payload) => ({ ...state, count: state.count + payload.by })),
 	)
 	.action((a) =>
-		a.name("counter/reset").payload(v.object({ to: v.optional(v.number(), 0) })).reduce((_state, payload) => ({ count: payload.to }))
+		a
+			.name("counter/reset")
+			.payload(v.object({ to: v.optional(v.number(), 0) }))
+			.reduce((_state, payload) => ({ count: payload.to })),
 	)
 	.command((c) =>
-		c.name("reset")
+		c
+			.name("reset")
 			.summary("Resets and announces")
 			.params(v.object({ to: v.optional(v.number(), 0), reason: v.string() }))
 			.result(v.object({ count: v.number() }))
 			.handler(async ({ to }, ctx) => {
 				await ctx.dispatch(ctx.uri, "counter/reset", { to });
 				return { count: to };
-			})
+			}),
 	)
-	.command((c) => c.name("pair").params(v.tuple([v.string(), v.number()])).result(v.null()).handler(() => null))
-	.command((c) => c.name("raw").params(v.string()).result(v.custom<{ a: number }>(() => true)).handler(() => ({ a: 1 })))
-	.notification((n) => n.name("counter/announced").summary("Someone reset the counter").payload(v.object({ text: v.string() })))
+	.command((c) =>
+		c
+			.name("pair")
+			.params(v.tuple([v.string(), v.number()]))
+			.result(v.null())
+			.handler(() => null),
+	)
+	.command((c) =>
+		c
+			.name("raw")
+			.params(v.string())
+			.result(v.custom<{ a: number }>(() => true))
+			.handler(() => ({ a: 1 })),
+	)
+	.notification((n) =>
+		n
+			.name("counter/announced")
+			.summary("Someone reset the counter")
+			.payload(v.object({ text: v.string() })),
+	)
 	.build();
 
 const log = durableChannel()
 	.env<{ now(): string }>()
 	.summary("A relay")
 	.command((c) =>
-		c.name("append")
+		c
+			.name("append")
 			.params(v.object({ line: v.string() }))
 			.result(v.null())
 			.handler(async ({ line }, ctx) => {
 				await ctx.notify(ctx.uri, "log/line", { line, at: ctx.env.now() });
 				return null;
-			})
+			}),
 	)
 	.notification((n) => n.name("log/line").payload(v.object({ line: v.string(), at: v.string() })))
 	.build();
 
-const index = durableChannel().state(v.object({ hits: v.number() }), { hits: 0 }).build();
+const index = durableChannel()
+	.state(v.object({ hits: v.number() }), { hits: 0 })
+	.build();
 
 const routes = durableRoutes()
 	.env<{ now(): string }>()
@@ -62,7 +87,7 @@ const routes = durableRoutes()
 
 describe("document", () => {
 	it("describes every route with the JSON Schema of its state, actions, commands and notifications", () => {
-		assertEquals(describeRoutes(routes, { info: { title: "Probe", version: "0.0.1" } }), {
+		deepStrictEqual(describeRoutes(routes, { info: { title: "Probe", version: "0.0.1" } }), {
 			opendurablechannel: DURABLE_CHANNEL_DOCUMENT_VERSION,
 			info: { title: "Probe", version: "0.0.1" },
 			channels: [
@@ -169,17 +194,17 @@ describe("document", () => {
 	});
 
 	it("falls back to a default info block", () => {
-		assertEquals(describeRoutes(durableRoutes().build()).info, { title: "Durable Channel Hub", version: "1.0.0" });
-		assertEquals(describeRoutes(durableRoutes().build()).channels, []);
+		deepStrictEqual(describeRoutes(durableRoutes().build()).info, { title: "Durable Channel Hub", version: "1.0.0" });
+		deepStrictEqual(describeRoutes(durableRoutes().build()).channels, []);
 	});
 
 	it("keeps summaries on the built definitions", () => {
-		assertEquals(counter.summary, "A number everyone can bump");
-		assertEquals(counter.actions["counter/incremented"].summary, "Adds `by` to the count");
-		assertEquals(counter.actions["counter/reset"].summary, undefined);
-		assertEquals(counter.commands.reset.summary, "Resets and announces");
-		assertEquals(counter.notifications["counter/announced"].summary, "Someone reset the counter");
-		assertEquals(log.summary, "A relay");
-		assertEquals(index.summary, undefined);
+		deepStrictEqual(counter.summary, "A number everyone can bump");
+		deepStrictEqual(counter.actions["counter/incremented"].summary, "Adds `by` to the count");
+		deepStrictEqual(counter.actions["counter/reset"].summary, undefined);
+		deepStrictEqual(counter.commands.reset.summary, "Resets and announces");
+		deepStrictEqual(counter.notifications["counter/announced"].summary, "Someone reset the counter");
+		deepStrictEqual(log.summary, "A relay");
+		deepStrictEqual(index.summary, undefined);
 	});
 });

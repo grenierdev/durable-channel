@@ -1,19 +1,19 @@
+import { toJsonSchema } from "@valibot/to-json-schema";
+import type { OpenAPIV3_1 } from "openapi-types";
 import {
 	type ErrorMessage,
 	type GenericSchema,
 	type InferInput,
 	type InferOutput,
-	object,
 	type ObjectEntries,
 	type ObjectIssue,
 	type ObjectSchema,
+	object,
 	safeParse,
 	type TupleIssue,
 	type TupleItems,
 	type TupleSchema,
 } from "valibot";
-import type { OpenAPIV3_1 } from "openapi-types";
-import { toJsonSchema } from "@valibot/to-json-schema";
 
 /** Schemas accepted for procedure params: an object (by-name) or a tuple (by-position). */
 export type HanaParamsSchema =
@@ -26,7 +26,7 @@ export type HanaDefaultParams = ObjectSchema<Record<never, never>, undefined>;
 /** Type-level map of procedure name to its params/result schemas. Phantom on `HanaCollection`. */
 export type HanaProcedureMap = Record<string, { params: HanaParamsSchema; result: GenericSchema }>;
 
-export interface HanaCollection<TEnv = unknown, TProcedures extends HanaProcedureMap = HanaProcedureMap> {
+export interface HanaCollection<TEnv = unknown, _TProcedures extends HanaProcedureMap = HanaProcedureMap> {
 	readonly procedures: Record<string, HanaProcedure<TEnv>>;
 }
 
@@ -42,10 +42,7 @@ export interface HanaContext<TEnv = unknown> {
 	env: TEnv;
 }
 
-export class HanaCollectionBuilder<
-	TEnv = unknown,
-	TProcedures extends HanaProcedureMap = Record<never, never>,
-> {
+export class HanaCollectionBuilder<TEnv = unknown, TProcedures extends HanaProcedureMap = Record<never, never>> {
 	#procedures: Set<HanaProcedureBuilder>;
 
 	constructor(procedures: Set<HanaProcedureBuilder> = new Set()) {
@@ -78,20 +75,13 @@ export class HanaCollectionBuilder<
 			| ((builder: HanaProcedureBuilder<TEnv>) => HanaProcedureBuilder<TProcEnv, TName, TParams, TResult>),
 	): HanaCollectionBuilder<
 		TEnv,
-		& TProcedures
-		& {
+		TProcedures & {
 			[T in TName]: { params: TParams; result: TResult };
 		}
 	> {
-		const result = builder instanceof HanaProcedureBuilder
-			? builder
-			: builder(new HanaProcedureBuilder<TEnv>(undefined, object({}), object({})));
-		return new HanaCollectionBuilder(
-			new Set([
-				...this.#procedures,
-				result as never,
-			]),
-		);
+		const result =
+			builder instanceof HanaProcedureBuilder ? builder : builder(new HanaProcedureBuilder<TEnv>(undefined, object({}), object({})));
+		return new HanaCollectionBuilder(new Set([...this.#procedures, result as never]));
 	}
 }
 
@@ -135,13 +125,7 @@ export class HanaProcedureBuilder<
 	}
 
 	env<TNewEnv>(): HanaProcedureBuilder<TNewEnv, TName, TParams, TResult> {
-		return new HanaProcedureBuilder<TNewEnv, TName, TParams, TResult>(
-			this.#name,
-			this.#params,
-			this.#result,
-			this.#handler,
-			this.#summary,
-		);
+		return new HanaProcedureBuilder<TNewEnv, TName, TParams, TResult>(this.#name, this.#params, this.#result, this.#handler, this.#summary);
 	}
 
 	name<TNewName extends string>(name: TNewName): HanaProcedureBuilder<TEnv, TNewName, TParams, TResult> {
@@ -152,9 +136,7 @@ export class HanaProcedureBuilder<
 		return new HanaProcedureBuilder<TEnv, TName, TParams, TResult>(this.#name, this.#params, this.#result, this.#handler, summary);
 	}
 
-	params<TNewParams extends HanaParamsSchema>(
-		params: TNewParams,
-	): HanaProcedureBuilder<TEnv, TName, TNewParams, TResult> {
+	params<TNewParams extends HanaParamsSchema>(params: TNewParams): HanaProcedureBuilder<TEnv, TName, TNewParams, TResult> {
 		return new HanaProcedureBuilder<TEnv, TName, TNewParams, TResult>(this.#name, params, this.#result, this.#handler, this.#summary);
 	}
 
@@ -167,20 +149,13 @@ export class HanaProcedureBuilder<
 	 * The return value is validated against the result schema, so it is typed as that schema's input.
 	 */
 	handler(
-		handler: (
-			params: InferOutput<TParams>,
-			ctx: HanaContext<TEnv>,
-			as: AbortSignal,
-		) => InferInput<TResult> | Promise<InferInput<TResult>>,
+		handler: (params: InferOutput<TParams>, ctx: HanaContext<TEnv>, as: AbortSignal) => InferInput<TResult> | Promise<InferInput<TResult>>,
 	): HanaProcedureBuilder<TEnv, TName, TParams, TResult> {
 		return new HanaProcedureBuilder<TEnv, TName, TParams, TResult>(this.#name, this.#params, this.#result, handler as never, this.#summary);
 	}
 }
 
-export function hana<
-	TEnv = unknown,
-	TProcedures extends HanaProcedureMap = Record<never, never>,
->(
+export function hana<TEnv = unknown, TProcedures extends HanaProcedureMap = Record<never, never>>(
 	builder: (hana: HanaCollectionBuilder<TEnv>) => HanaCollectionBuilder<TEnv, TProcedures> = (b) => b,
 ): HanaCollectionBuilder<TEnv, TProcedures> {
 	return builder(new HanaCollectionBuilder<TEnv>());
@@ -285,15 +260,16 @@ export class Hana<TEnv = unknown, TProcedures extends HanaProcedureMap = HanaPro
 			methods: Object.values(this.#collection.procedures).map((procedure) => ({
 				name: procedure.name,
 				...(procedure.summary ? { summary: procedure.summary } : {}),
-				params: procedure.params.type === "object"
-					? Object.entries(procedure.params.entries).map(([name, schema]) => ({
-						name,
-						...(isRequiredParam(schema) ? { required: true } : {}),
-						schema: toJsonSchema(schema, { typeMode: "input" }),
-					}))
-					: procedure.params.items.map((schema) => ({
-						schema: toJsonSchema(schema, { typeMode: "input" }),
-					})),
+				params:
+					procedure.params.type === "object"
+						? Object.entries(procedure.params.entries).map(([name, schema]) => ({
+								name,
+								...(isRequiredParam(schema) ? { required: true } : {}),
+								schema: toJsonSchema(schema, { typeMode: "input" }),
+							}))
+						: procedure.params.items.map((schema) => ({
+								schema: toJsonSchema(schema, { typeMode: "input" }),
+							})),
 				result: toJsonSchema(procedure.result, { typeMode: "input" }),
 			})),
 		};
@@ -377,10 +353,7 @@ export const JsonRpcRequest: v.GenericSchema<JsonRpcRequest> = v.pipe(
 		method: v.string(),
 		// `array` must come before `record`: valibot's `record` accepts arrays and rewrites
 		// `["a", 1]` into `{ "0": "a", "1": 1 }`, which would break by-position calls.
-		params: v.optional(v.union([
-			v.array(v.unknown()),
-			v.record(v.string(), v.unknown()),
-		])),
+		params: v.optional(v.union([v.array(v.unknown()), v.record(v.string(), v.unknown())])),
 	}),
 	v.title("JsonRpcRequest"),
 	v.description("A JSON-RPC request object"),
@@ -428,7 +401,4 @@ export const JsonRpcResponseResult: v.GenericSchema<JsonRpcResponseResult> = v.p
 
 export type JsonRpcResponse = JsonRpcResponseError | JsonRpcResponseResult;
 
-export const JsonRpcResponse: v.GenericSchema<JsonRpcResponse> = v.union([
-	JsonRpcResponseError,
-	JsonRpcResponseResult,
-]) as never;
+export const JsonRpcResponse: v.GenericSchema<JsonRpcResponse> = v.union([JsonRpcResponseError, JsonRpcResponseResult]) as never;

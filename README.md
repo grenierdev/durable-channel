@@ -6,7 +6,7 @@ committed; ephemeral messages are named **notifications**. A **hub** holds a map
 instances, the connections, one global sequence number, a bounded replay ring and the storage.
 
 The point of the split is that the definition is isomorphic: the same value drives the server and the client, which mirrors the state by
-running the same reducers on the envelopes the hub broadcasts. The library modules use only web-standard APIs, so a hub also runs inside a
+running the same reducers on the envelopes the hub broadcasts. The core library modules use only web-standard APIs, so a hub also runs inside a
 Cloudflare Durable Object with the object's `state.storage` behind `DurableChannelStorage`, and the client runs in a browser. A wire
 protocol is not baked into any of it: `rpc.ts` is one JSON-RPC surface over a hub, and it is the only module that knows a wire exists.
 
@@ -15,8 +15,7 @@ protocol is not baked into any of it: `rpc.ts` is one JSON-RPC surface over a hu
 `durable-channel` is published to npm:
 
 ```sh
-deno add npm:durable-channel   # Deno
-npm install durable-channel    # Node
+npm install durable-channel
 ```
 
 Import it by name:
@@ -194,18 +193,29 @@ Middleware validates custom fields. The library checks the nonempty `id` and sha
 treat nested data as immutable.
 
 For a browser WebSocket, verify the session and allowed Origin before upgrading. Here `readSession` and `isAllowedOrigin` are your
-application's middleware functions, and `hub`/`rpc` serve the typed routes above:
+application's middleware functions, and `hub`/`rpc` serve the typed routes above. Install the Node HTTP/WebSocket adapters with
+`npm install @hono/node-server ws` (and `npm install -D @types/ws` for TypeScript):
 
 ```ts
-async function handleUpgrade(request: Request): Promise<Response> {
-	if (!isAllowedOrigin(request)) return new Response("Forbidden", { status: 403 });
+import { serve, upgradeWebSocket } from "@hono/node-server";
+import { Hono } from "hono";
+import { WebSocketServer, type WebSocket } from "ws";
+
+const app = new Hono();
+app.get("/rpc", async (context, next) => {
+	const request = context.req.raw;
+	if (!isAllowedOrigin(request)) return context.text("Forbidden", 403);
 	const principal: Principal | undefined = await readSession(request);
-	const { socket, response } = Deno.upgradeWebSocket(request);
-	const session = attachSocket(rpc, hub, socket, principal === undefined ? undefined : { principal });
-	// Keep this session in your host's session registry. On logout, expiry or revocation:
-	// session.close(1008, "Session ended");
-	return response;
-}
+	return upgradeWebSocket(() => ({
+		onOpen(_event, socket) {
+			const session = attachSocket(rpc, hub, socket.raw as WebSocket, principal === undefined ? undefined : { principal });
+			// Keep this session in your host's session registry. On logout, expiry or revocation:
+			// session.close(1008, "Session ended");
+		},
+	}))(context, next);
+});
+
+serve({ fetch: app.fetch, port: 8000, websocket: { server: new WebSocketServer({ noServer: true }) } });
 ```
 
 Without a socket, use `hub.connect({ id: tabId, principal, send })`, then pass its returned connection handle to `subscribe`,
@@ -339,8 +349,7 @@ while: a streaming agent, a long import, a watcher. `ctx.background(task)` hands
 | Errors     | swallowed — a background task has no caller to report to. A `dispatch` on a URI that was just destroyed throws and dies here |
 | Shutdown   | `await hub.close()` aborts every task, waits for all of them to settle, and refuses new ones                                 |
 
-`hub.close()` is what a test or a process shutdown needs: without it a task can outlive the hub, keep dispatching, and — under Deno's op
-sanitizer — fail the test that started it.
+`hub.close()` is what a test or a process shutdown needs: without it a task can outlive the hub, keep dispatching, and hold the process open.
 
 ## Stateless channels
 
@@ -758,7 +767,7 @@ consumer can tell a goodbye from a drop.
 | Implementation                          | For                                                                                                      |
 | --------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | `InMemoryTransport.pair()`              | tests, and a client and a hub in one runtime. Frames go through JSON, so nothing a socket drops survives |
-| `WebSocketTransport.connect(url)`       | the global `WebSocket`, in a browser, in Deno and in Node. One JSON text frame per message               |
+| `WebSocketTransport.connect(url)`       | the global `WebSocket`, in a browser and in Node. One JSON text frame per message               |
 | `WebSocketTransport.fromSocket(socket)` | a socket whose handshake you ran yourself                                                                |
 
 Writing your own is those three methods and nothing else: deliver frames in order, resolve `recv()` with `null` on a clean close, throw a
@@ -768,24 +777,26 @@ Writing your own is those three methods and nothing else: deliver frames in orde
 
 `attachSocket(rpc, hub, socket, { principal? }?)` is the whole server side for one socket: it owns a link, answers frames in arrival order —
 one promise chain, so a slow `exec` cannot let the next frame overtake it — and turns everything the hub broadcasts into a notification
-frame. The socket is typed as `{ send, close, addEventListener }`, so the global `WebSocket`, a Deno upgraded socket and a Durable Object's
-server-side socket all fit.
+frame. The socket is typed as `{ send, close, addEventListener }`, so the global `WebSocket`, a Node `ws` socket and a Durable Object's
+server-side socket all fit. For the Node host below, install `@hono/node-server` and `ws`, plus `@types/ws` for TypeScript.
 
 ```ts
+import { serve, upgradeWebSocket } from "@hono/node-server";
 import { Hono } from "hono";
+import { WebSocketServer, type WebSocket } from "ws";
 import { attachSocket, createRpc, DurableChannelHub, MemoryStorage } from "durable-channel";
 
 const hub = new DurableChannelHub(routes, { storage: new MemoryStorage(), env });
 const rpc = createRpc(hub);
 
 const app = new Hono();
-app.get("/rpc", (context) => {
-	const { socket, response } = Deno.upgradeWebSocket(context.req.raw);
-	attachSocket(rpc, hub, socket);
-	return response;
-});
+app.get("/rpc", upgradeWebSocket(() => ({
+	onOpen(_event, socket) {
+		attachSocket(rpc, hub, socket.raw as WebSocket);
+	},
+})));
 
-Deno.serve({ port: 8000 }, app.fetch);
+serve({ fetch: app.fetch, port: 8000, websocket: { server: new WebSocketServer({ noServer: true }) } });
 ```
 
 It hands back `{ link, detach() }`. `detach()` disconnects the link from the hub and stops answering; the socket's own `close` and `error`
@@ -814,18 +825,21 @@ The template sits in the key so `list(template)` is a single prefix scan.
 | Implementation  | Opened with                       | Notes                                                                                             |
 | --------------- | --------------------------------- | ------------------------------------------------------------------------------------------------- |
 | `MemoryStorage` | `new MemoryStorage()`             | process-local, values structurally cloned in and out                                              |
-| `DenoKvStorage` | `await DenoKvStorage.open(path?)` | wraps `Deno.openKv(path)`; `":memory:"` gives a throwaway store; dispose it to close the database |
+| `SqliteStorage` | `await SqliteStorage.open(path?)` | Node SQLite; a file path persists across restarts; the default `":memory:"` gives a throwaway store; dispose it to close the database |
 
 ```ts
-using storage = await DenoKvStorage.open(":memory:");
+import { SqliteStorage } from "durable-channel/storage/sqlite";
+
+using storage = await SqliteStorage.open("./channels.sqlite");
 const hub = new DurableChannelHub(routes, { storage, env });
 ```
 
 Both satisfy the same contract, which `storage.test.ts` asserts once and runs against each: keys sort segment-wise so `["a", "b"]` comes
 before `["a", "b", "c"]`, a page carries a `cursor` only when an entry really follows it, cursors are opaque, and a value that was written
-cannot be reached again through the object that wrote it. `DenoKvStorage` is the only Deno-specific code in the library and it reaches for
-the runtime inside `open` alone, so importing `storage.ts` elsewhere never touches `Deno`; on a runtime without it, `open` fails with a
-`DurableChannelError` whose code is `STORAGE_UNAVAILABLE`.
+cannot be reached again through the object that wrote it. SQLite serializes values as JSON and indexes keys in segment-wise order for
+prefix scans. Database operations use Node’s synchronous SQLite API behind the asynchronous storage interface.
+`SqliteStorage` is a separate Node-only entry point; importing the core library never loads `node:sqlite`. Close the hub
+before disposing its storage. Existing KV databases must be exported and imported into SQLite; the database formats differ.
 
 ## Errors
 
@@ -852,8 +866,8 @@ matching on messages.
 | `NotInitializedError`         | `NOT_INITIALIZED`         | a wire call that needs a client id arrived on a link nothing has bound                                |
 | `RejectAction`                | —                         | a reducer refused the action; **not** a `DurableChannelError`                                         |
 
-`DurableChannelError` is also thrown directly, with the code `STORAGE_UNAVAILABLE`, when `DenoKvStorage.open` runs on a runtime that has no
-`Deno.openKv`. An action effect's failure is not translated at all: whatever it throws reaches whoever dispatched the action.
+An action effect's failure is not translated at all: whatever it throws reaches whoever dispatched the action. SQLite failures propagate
+from the underlying database.
 
 A client raises those same classes for anything it can decide from the route map, and its own family for everything that is about the link
 rather than about a channel:
@@ -890,3 +904,28 @@ rather than about a channel:
   rather than a warning, and an undecodable notification is simply ignored.
 - The client answers a server-initiated request with `-32601`. There is no way to install a handler for one: the protocol has no method a
   hub calls on a peer.
+
+## Contributing
+
+Use Node.js 24.4 or newer and npm. The root `package.json` owns the package version, dependencies, and exports.
+
+```sh
+npm install
+npm run lint                      # Biome checks formatting, imports, and lint rules
+npm run check                     # TypeScript: library, tests, and tooling
+npm test                          # Vitest, runs once
+npm test -- src/client.test.ts
+npm test -- -t "reopens a file"
+npm run fmt                       # Biome: tabs, line width 140
+npm run build                     # JavaScript, declarations, and source maps
+```
+
+Tests sit beside their subjects in `src/`; `test/` contains shared assertion and Node WebSocket server helpers. The WebSocket tests
+use real Node listeners, and persistent storage tests exercise both in-memory SQLite and reopening a file-backed database.
+
+`npm run build` cleans `dist/` and compiles with `tsc`. Source imports keep their `.ts` extensions; TypeScript rewrites them to `.js`
+in emitted JavaScript. The compiled library lives in `dist/src/`, alongside declarations and source maps. Runtime npm dependencies
+remain external. `.npmignore` excludes compiled tests and development tooling from the package.
+
+`npm pack` builds automatically through `prepack` and creates the publishable package. To publish, run
+`npm publish --access public --tag next`; omit the tag for `latest`.

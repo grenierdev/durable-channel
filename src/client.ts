@@ -11,7 +11,7 @@
  * Everything ambient stays out. Effects and background work are server-side, `env` never reaches a
  * reducer, and the client never retries, backs off or opens a socket by itself: it is given a
  * {@link DurableChannelTransport} and the application decides when to `connect`, when to `reconnect`
- * and when to give up. Only web-standard APIs are used, so the same client runs in a browser, in Deno
+ * and when to give up. Only web-standard APIs are used, so the same client runs in a browser, in Node.js
  * and inside a worker.
  */
 import type { InferInput, InferOutput } from "valibot";
@@ -42,14 +42,6 @@ import {
 	UnknownActionError,
 } from "./error.ts";
 import {
-	type DurableChannelHelloResult,
-	type DurableChannelRpcFrame,
-	DurableChannelWireEnvelope,
-	DurableChannelWirePrincipal,
-	DurableChannelWireSnapshot,
-	fromRpcNotification,
-} from "./rpc.ts";
-import {
 	type DurableChannelRoute,
 	type DurableChannelRouteMap,
 	type DurableChannelRoutes,
@@ -59,6 +51,14 @@ import {
 	type PathToParams,
 	resolveUri,
 } from "./routes.ts";
+import {
+	type DurableChannelHelloResult,
+	type DurableChannelRpcFrame,
+	DurableChannelWireEnvelope,
+	DurableChannelWirePrincipal,
+	DurableChannelWireSnapshot,
+	fromRpcNotification,
+} from "./rpc.ts";
 import type { DurableChannelTransport } from "./transport.ts";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -69,8 +69,11 @@ const DEFAULT_SUBSCRIPTION_BUFFER = 4096;
 type Matched<TRoutes extends DurableChannelRouteMap, TUri extends string> = Extract<MatchRoute<TRoutes, TUri>, DurableChannelRouteTypes>;
 
 /** The state type the route of a URI literal declares, or `unknown` when nothing matches it. */
-export type DurableChannelClientStateOf<TRoutes extends DurableChannelRouteMap, TUri extends string> = [Matched<TRoutes, TUri>] extends
-	[never] ? unknown : Matched<TRoutes, TUri>["state"];
+export type DurableChannelClientStateOf<TRoutes extends DurableChannelRouteMap, TUri extends string> = [Matched<TRoutes, TUri>] extends [
+	never,
+]
+	? unknown
+	: Matched<TRoutes, TUri>["state"];
 
 type ActionsOf<TRoutes extends DurableChannelRouteMap, TUri extends string> = [Matched<TRoutes, TUri>] extends [never]
 	? DurableChannelActionMap
@@ -128,9 +131,7 @@ export type DurableChannelConnectionState =
 	| { readonly status: "closed"; readonly reason: DurableChannelClosedReason };
 
 /** Why a link ended. */
-export type DurableChannelClosedReason =
-	| { readonly type: "shutdown" }
-	| { readonly type: "transport"; readonly error: TransportError };
+export type DurableChannelClosedReason = { readonly type: "shutdown" } | { readonly type: "transport"; readonly error: TransportError };
 
 /** What {@link DurableChannelClient.subscribe} hands back. */
 export interface DurableChannelSubscribeHandle {
@@ -945,9 +946,8 @@ export class DurableChannelClient<
 	}
 
 	#reconcile(mirror: Mirror<TEnv, TPrincipal>, envelope: DurableChannelEnvelope): void {
-		const own = envelope.origin?.clientId === this.#clientId && envelope.origin?.principalId === this.#principal?.id
-			? envelope.origin
-			: undefined;
+		const own =
+			envelope.origin?.clientId === this.#clientId && envelope.origin?.principalId === this.#principal?.id ? envelope.origin : undefined;
 		if (own !== undefined) {
 			const settled: PendingEntry[] = [];
 			mirror.pending = mirror.pending.filter((entry) => {
@@ -1027,7 +1027,10 @@ export class DurableChannelClient<
 		this.#failRequests(new TransportError("closed", "The transport was replaced"));
 		const previous = this.#transport;
 		this.#transport = transport;
-		if (previous !== transport) void Promise.resolve().then(() => previous.close()).catch(() => {});
+		if (previous !== transport)
+			void Promise.resolve()
+				.then(() => previous.close())
+				.catch(() => {});
 		this.#loop = undefined;
 		this.#setState({ status: "connected" });
 		this.#loop = this.#drive(transport);

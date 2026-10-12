@@ -1,1 +1,12 @@
-*.test.ts
+# Publish compiled library files and documentation.
+/*
+!/dist/
+!/README.md
+!/LICENSE*
+
+# Exclude compiled development tooling and tests.
+/dist/*
+!/dist/src/
+**/*.test.*
+**/*.spec.*
+**/*.tsbuildinfo

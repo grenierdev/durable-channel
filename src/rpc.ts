@@ -12,10 +12,11 @@
  * {@link attachSocket} is the whole server for a socket: it owns a link, answers frames in arrival
  * order, and translates what the hub broadcasts into notifications.
  */
-import { Hana, hana, type HanaCollection, JsonRpcError, type JsonRpcRequest, type JsonRpcResponse } from "./hana.ts";
+
 import * as v from "valibot";
 import type { DurableChannelEnvelope, DurableChannelMessage, DurableChannelPrincipal, DurableChannelSnapshot } from "./channel.ts";
 import { DurableChannelError, NotInitializedError, RejectAction } from "./error.ts";
+import { Hana, type HanaCollection, hana, JsonRpcError, type JsonRpcRequest, type JsonRpcResponse } from "./hana.ts";
 import type { DurableChannelConnection, DurableChannelHub } from "./hub.ts";
 import type { DurableChannelRouteMap } from "./routes.ts";
 
@@ -244,7 +245,8 @@ export function createRpc<TEnv, TRoutes extends DurableChannelRouteMap, TPrincip
 	const collection = hana()
 		.env<Env>()
 		.def((b) =>
-			b.name("hello")
+			b
+				.name("hello")
 				.summary("Binds the link to a client id and subscribes it")
 				.params(v.object({ clientId: v.pipe(v.string(), v.minLength(1)), subscriptions: v.optional(v.array(v.string()), []) }))
 				.result(
@@ -254,76 +256,85 @@ export function createRpc<TEnv, TRoutes extends DurableChannelRouteMap, TPrincip
 						principal: v.exactOptional(DurableChannelWirePrincipal),
 					}),
 				)
-				.handler(async (params, ctx) =>
-					await guard(async () => {
-						ctx.env.link.bind(params.clientId);
-						try {
-							const connection = bound(ctx.env.link);
-							const snapshots: DurableChannelSnapshot[] = [];
-							for (const uri of params.subscriptions) {
-								const snapshot = await ctx.env.hub.subscribe(connection, uri);
-								if (snapshot !== undefined) {
-									snapshots.push(snapshot);
+				.handler(
+					async (params, ctx) =>
+						await guard(async () => {
+							ctx.env.link.bind(params.clientId);
+							try {
+								const connection = bound(ctx.env.link);
+								const snapshots: DurableChannelSnapshot[] = [];
+								for (const uri of params.subscriptions) {
+									const snapshot = await ctx.env.hub.subscribe(connection, uri);
+									if (snapshot !== undefined) {
+										snapshots.push(snapshot);
+									}
 								}
+								return {
+									serverSeq: ctx.env.hub.serverSeq,
+									snapshots,
+									...(connection.principal === undefined ? {} : { principal: { id: connection.principal.id } }),
+								};
+							} catch (error) {
+								ctx.env.link.unbind();
+								throw error;
 							}
-							return {
-								serverSeq: ctx.env.hub.serverSeq,
-								snapshots,
-								...(connection.principal === undefined ? {} : { principal: { id: connection.principal.id } }),
-							};
-						} catch (error) {
-							ctx.env.link.unbind();
-							throw error;
-						}
-					})
-				)
+						}),
+				),
 		)
 		.def((b) =>
-			b.name("ping")
+			b
+				.name("ping")
 				.summary("Liveness check. Works before hello")
 				.params(v.object({}))
 				.result(v.null())
-				.handler(() => null)
+				.handler(() => null),
 		)
 		.def((b) =>
-			b.name("reconnect")
+			b
+				.name("reconnect")
 				.summary("Rebinds the link and restores its subscriptions")
-				.params(v.object({
-					clientId: v.pipe(v.string(), v.minLength(1)),
-					lastSeenServerSeq: v.number(),
-					subscriptions: v.optional(v.array(v.string()), []),
-				}))
-				.result(WireReconnectResult)
-				.handler(async (params, ctx) =>
-					await guard(async () => {
-						ctx.env.link.bind(params.clientId);
-						try {
-							const result = await ctx.env.hub.reconnect(bound(ctx.env.link), params.lastSeenServerSeq, params.subscriptions);
-							const identity = result.principal === undefined ? {} : { principal: { id: result.principal.id } };
-							return result.type === "replay"
-								? { ...identity, type: "replay" as const, actions: [...result.actions], missing: [...result.missing] }
-								: { ...identity, type: "snapshot" as const, snapshots: [...result.snapshots], missing: [...result.missing] };
-						} catch (error) {
-							ctx.env.link.unbind();
-							throw error;
-						}
-					})
+				.params(
+					v.object({
+						clientId: v.pipe(v.string(), v.minLength(1)),
+						lastSeenServerSeq: v.number(),
+						subscriptions: v.optional(v.array(v.string()), []),
+					}),
 				)
+				.result(WireReconnectResult)
+				.handler(
+					async (params, ctx) =>
+						await guard(async () => {
+							ctx.env.link.bind(params.clientId);
+							try {
+								const result = await ctx.env.hub.reconnect(bound(ctx.env.link), params.lastSeenServerSeq, params.subscriptions);
+								const identity = result.principal === undefined ? {} : { principal: { id: result.principal.id } };
+								return result.type === "replay"
+									? { ...identity, type: "replay" as const, actions: [...result.actions], missing: [...result.missing] }
+									: { ...identity, type: "snapshot" as const, snapshots: [...result.snapshots], missing: [...result.missing] };
+							} catch (error) {
+								ctx.env.link.unbind();
+								throw error;
+							}
+						}),
+				),
 		)
 		.def((b) =>
-			b.name("subscribe")
+			b
+				.name("subscribe")
 				.summary("Subscribes the link to one channel")
 				.params(v.object({ channel: v.string() }))
 				.result(v.object({ snapshot: v.exactOptional(DurableChannelWireSnapshot) }))
-				.handler(async (params, ctx) =>
-					await guard(async () => {
-						const snapshot = await ctx.env.hub.subscribe(bound(ctx.env.link), params.channel);
-						return snapshot === undefined ? {} : { snapshot };
-					})
-				)
+				.handler(
+					async (params, ctx) =>
+						await guard(async () => {
+							const snapshot = await ctx.env.hub.subscribe(bound(ctx.env.link), params.channel);
+							return snapshot === undefined ? {} : { snapshot };
+						}),
+				),
 		)
 		.def((b) =>
-			b.name("unsubscribe")
+			b
+				.name("unsubscribe")
 				.summary("Drops one subscription of the link")
 				.params(v.object({ channel: v.string() }))
 				.result(v.null())
@@ -332,39 +343,43 @@ export function createRpc<TEnv, TRoutes extends DurableChannelRouteMap, TPrincip
 						ctx.env.hub.unsubscribe(bound(ctx.env.link), params.channel);
 						return null;
 					});
-				})
+				}),
 		)
 		.def((b) =>
-			b.name("dispatch")
+			b
+				.name("dispatch")
 				.summary("Commits an action for the link, leniently")
-				.params(v.object({
-					channel: v.string(),
-					clientSeq: v.number(),
-					name: v.string(),
-					payload: v.optional(v.unknown(), {}),
-				}))
-				.result(v.nullable(DurableChannelWireEnvelope))
-				.handler(async (params, ctx) =>
-					await guard(async () =>
-						await ctx.env.hub.dispatchFrom(
-							bound(ctx.env.link),
-							params.channel,
-							params.name,
-							params.payload,
-							params.clientSeq,
-							{ lenient: true },
-						) ?? null
-					)
+				.params(
+					v.object({
+						channel: v.string(),
+						clientSeq: v.number(),
+						name: v.string(),
+						payload: v.optional(v.unknown(), {}),
+					}),
 				)
+				.result(v.nullable(DurableChannelWireEnvelope))
+				.handler(
+					async (params, ctx) =>
+						await guard(
+							async () =>
+								(await ctx.env.hub.dispatchFrom(bound(ctx.env.link), params.channel, params.name, params.payload, params.clientSeq, {
+									lenient: true,
+								})) ?? null,
+						),
+				),
 		)
 		.def((b) =>
-			b.name("exec")
+			b
+				.name("exec")
 				.summary("Runs a command of a channel on behalf of the link")
 				.params(v.object({ channel: v.string(), name: v.string(), params: v.optional(v.unknown(), {}) }))
 				.result(v.unknown())
-				.handler(async (params, ctx, signal) =>
-					await guard(async () => await ctx.env.hub.execFrom(bound(ctx.env.link), params.channel, params.name, params.params, { signal }))
-				)
+				.handler(
+					async (params, ctx, signal) =>
+						await guard(
+							async () => await ctx.env.hub.execFrom(bound(ctx.env.link), params.channel, params.name, params.params, { signal }),
+						),
+				),
 		)
 		.build();
 	const runtime = new Hana(collection);
@@ -379,7 +394,8 @@ export function createRpc<TEnv, TRoutes extends DurableChannelRouteMap, TPrincip
 export interface DurableChannelSocket {
 	send(data: string): void;
 	close(code?: number, reason?: string): void;
-	addEventListener(type: string, listener: (event: { readonly data: unknown }) => void): void;
+	addEventListener(type: "message", listener: (event: { readonly data: unknown }) => void): void;
+	addEventListener(type: "close" | "error", listener: () => void): void;
 }
 
 /** What {@link attachSocket} hands back. */
@@ -418,8 +434,8 @@ async function textOf(data: unknown): Promise<string> {
  *
  * Frames are answered in arrival order — one promise chain, so a slow `exec` cannot let the next frame
  * overtake it — and everything the hub broadcasts to the bound connection leaves as an `action` or
- * `notification` frame. This is the whole server side of the protocol; a Hono route, a `Deno.serve`
- * handler and a Durable Object's `fetch` all need nothing more than to hand their socket over.
+ * `notification` frame. This is the whole server side of the protocol; a Hono route and a Durable
+ * Object's `fetch` all need nothing more than to hand their socket over.
  */
 export function attachSocket<TEnv, TRoutes extends DurableChannelRouteMap, TPrincipal extends DurableChannelPrincipal>(
 	rpc: DurableChannelRpc<TEnv, TRoutes, TPrincipal>,
@@ -494,8 +510,7 @@ export function attachSocket<TEnv, TRoutes extends DurableChannelRouteMap, TPrin
 			socket.send(JSON.stringify(response));
 		}
 	};
-	const on = (type: string, listener: (event: { readonly data: unknown }) => void): void => socket.addEventListener(type, listener);
-	on("message", (event) => {
+	socket.addEventListener("message", (event) => {
 		const { data } = event;
 		queue = queue.then(async () => {
 			try {
@@ -506,7 +521,7 @@ export function attachSocket<TEnv, TRoutes extends DurableChannelRouteMap, TPrin
 			}
 		});
 	});
-	on("close", detach);
-	on("error", detach);
+	socket.addEventListener("close", detach);
+	socket.addEventListener("error", detach);
 	return { link, detach, close };
 }

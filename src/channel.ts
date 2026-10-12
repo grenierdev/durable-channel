@@ -30,7 +30,7 @@ export const DurableChannelPermission = {
 	All: 7,
 } as const;
 
-export type DurableChannelPermission = typeof DurableChannelPermission[keyof typeof DurableChannelPermission];
+export type DurableChannelPermission = (typeof DurableChannelPermission)[keyof typeof DurableChannelPermission];
 
 /** The operation being authorized. Action payloads and command params have passed their schemas. */
 export type DurableChannelAuthorizationRequest =
@@ -101,17 +101,17 @@ export interface DurableChannelSnapshot {
 /** What a reconnect could restore. `missing` lists the URIs the hub cannot resume. */
 export type DurableChannelReconnectResult =
 	| {
-		readonly type: "replay";
-		readonly actions: readonly DurableChannelEnvelope[];
-		readonly missing: readonly string[];
-		readonly principal?: DurableChannelPrincipal;
-	}
+			readonly type: "replay";
+			readonly actions: readonly DurableChannelEnvelope[];
+			readonly missing: readonly string[];
+			readonly principal?: DurableChannelPrincipal;
+	  }
 	| {
-		readonly type: "snapshot";
-		readonly snapshots: readonly DurableChannelSnapshot[];
-		readonly missing: readonly string[];
-		readonly principal?: DurableChannelPrincipal;
-	};
+			readonly type: "snapshot";
+			readonly snapshots: readonly DurableChannelSnapshot[];
+			readonly missing: readonly string[];
+			readonly principal?: DurableChannelPrincipal;
+	  };
 
 /** One live instance of a route. */
 export interface DurableChannelInstance<TState = unknown> {
@@ -506,10 +506,7 @@ export class DurableChannelCommandBuilder<
 }
 
 /** Builds one notification. */
-export class DurableChannelNotificationBuilder<
-	TName extends string = string,
-	TPayload extends GenericSchema = GenericSchema,
-> {
+export class DurableChannelNotificationBuilder<TName extends string = string, TPayload extends GenericSchema = GenericSchema> {
 	#name: string | undefined;
 	#payload: GenericSchema | undefined;
 	#summary: string | undefined;

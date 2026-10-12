@@ -17,10 +17,7 @@ export const JsonRpcRequest: v.GenericSchema<JsonRpcRequest> = v.pipe(
 		method: v.string(),
 		// `array` must come before `record`: valibot's `record` accepts arrays and rewrites
 		// `["a", 1]` into `{ "0": "a", "1": 1 }`, which would break by-position calls.
-		params: v.optional(v.union([
-			v.array(v.unknown()),
-			v.record(v.string(), v.unknown()),
-		])),
+		params: v.optional(v.union([v.array(v.unknown()), v.record(v.string(), v.unknown())])),
 	}),
 	v.title("JsonRpcRequest"),
 	v.description("A JSON-RPC request object"),
@@ -68,7 +65,4 @@ export const JsonRpcResponseResult: v.GenericSchema<JsonRpcResponseResult> = v.p
 
 export type JsonRpcResponse = JsonRpcResponseError | JsonRpcResponseResult;
 
-export const JsonRpcResponse: v.GenericSchema<JsonRpcResponse> = v.union([
-	JsonRpcResponseError,
-	JsonRpcResponseResult,
-]) as never;
+export const JsonRpcResponse: v.GenericSchema<JsonRpcResponse> = v.union([JsonRpcResponseError, JsonRpcResponseResult]) as never;

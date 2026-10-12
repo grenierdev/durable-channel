@@ -1,10 +1,9 @@
-import { describe, it } from "node:test";
-import { assert, assertEquals, assertRejects } from "@std/assert";
+import { deepStrictEqual, ok, rejects } from "node:assert/strict";
 import * as v from "valibot";
+import { describe, it } from "vitest";
 import {
 	ConnectionNotFoundError,
 	createRpc,
-	durableChannel,
 	type DurableChannelAuthorizationHandler,
 	type DurableChannelAuthorizationRequest,
 	DurableChannelClient,
@@ -12,11 +11,12 @@ import {
 	DurableChannelHub,
 	type DurableChannelLink,
 	type DurableChannelMessage,
-	DurableChannelPermission as Permission,
+	durableChannel,
 	durableRoutes,
 	InMemoryTransport,
 	MemoryStorage,
 	NotClientDispatchableError,
+	DurableChannelPermission as Permission,
 	PermissionDeniedError,
 	RouteNotFoundError,
 	RpcError,
@@ -30,34 +30,54 @@ type Policy = DurableChannelAuthorizationHandler<Env, State, Principal>;
 
 function boot(policy: Policy, replayLimit = 10) {
 	const env: Env = { effects: 0, commands: 0 };
-	const definition = durableChannel().env<Env>().principal<Principal>()
+	const definition = durableChannel()
+		.env<Env>()
+		.principal<Principal>()
 		.state(v.object({ count: v.number() }), { count: 0 })
 		.client(policy)
 		.summary("Authorized counter")
 		.action((a) =>
-			a.name("add").payload(v.object({ by: v.optional(v.number(), 1) })).client()
+			a
+				.name("add")
+				.payload(v.object({ by: v.optional(v.number(), 1) }))
+				.client()
 				.reduce((state, payload) => ({ count: state.count + payload.by }))
 				.effect((ctx) => {
 					ctx.env.effects++;
-				})
+				}),
 		)
-		.action((a) => a.name("server").payload(v.object({})).reduce((state) => ({ count: state.count + 1 })))
+		.action((a) =>
+			a
+				.name("server")
+				.payload(v.object({}))
+				.reduce((state) => ({ count: state.count + 1 })),
+		)
 		.command((c) =>
-			c.name("read").params(v.object({ label: v.optional(v.string(), "default") })).result(v.number())
+			c
+				.name("read")
+				.params(v.object({ label: v.optional(v.string(), "default") }))
+				.result(v.number())
 				.handler(async (_params, ctx) => {
 					ctx.env.commands++;
 					return (await ctx.state()).count;
-				})
+				}),
 		)
 		.command((c) =>
-			c.name("nested").params(v.object({})).result(v.number())
-				.handler(async (_params, ctx) => await ctx.exec("private://", "read", {}) as number)
+			c
+				.name("nested")
+				.params(v.object({}))
+				.result(v.number())
+				.handler(async (_params, ctx) => (await ctx.exec("private://", "read", {})) as number),
 		)
 		.notification((n) => n.name("notice").payload(v.string()))
 		.build();
-	const routes = durableRoutes().env<Env>().principal<Principal>()
-		.route("counter://", definition).route("counter:/:id", definition)
-		.route("private://", definition, { internal: true }).build();
+	const routes = durableRoutes()
+		.env<Env>()
+		.principal<Principal>()
+		.route("counter://", definition)
+		.route("counter:/:id", definition)
+		.route("private://", definition, { internal: true })
+		.build();
 	const hub = new DurableChannelHub(routes, { env, storage: new MemoryStorage(), replayLimit });
 	const rpc = createRpc(hub);
 	const principal: Principal = { id: "alice", role: "writer" };
@@ -103,7 +123,7 @@ function boot(policy: Policy, replayLimit = 10) {
 
 function gate() {
 	let release!: () => void;
-	const promise = new Promise<void>((resolve) => release = resolve);
+	const promise = new Promise<void>((resolve) => (release = resolve));
 	return { promise, release };
 }
 
@@ -114,23 +134,36 @@ describe("channel authorization", () => {
 			seen.push(await ctx.state());
 			return Permission.None;
 		});
-		const relay = base.env<Env>().principal<Principal>().summary("relay")
-			.command((c) => c.name("read").params(v.object({})).result(v.null()).handler(() => null))
+		const relay = base
+			.env<Env>()
+			.principal<Principal>()
+			.summary("relay")
+			.command((c) =>
+				c
+					.name("read")
+					.params(v.object({}))
+					.result(v.null())
+					.handler(() => null),
+			)
 			.notification((n) => n.name("notice").payload(v.string()));
 		const stateful = relay.state(v.number(), 0).env<Env>().principal<Principal>().summary("stateful");
-		const routes = durableRoutes().env<Env>().principal<Principal>()
-			.route("relay://", relay.build()).route("state://", stateful.build())
-			.route("open://", relay.client().build()).build();
+		const routes = durableRoutes()
+			.env<Env>()
+			.principal<Principal>()
+			.route("relay://", relay.build())
+			.route("state://", stateful.build())
+			.route("open://", relay.client().build())
+			.build();
 		const hub = new DurableChannelHub(routes, { env: { effects: 0, commands: 0 }, storage: new MemoryStorage() });
 		const connection = hub.connect({ id: "guest", send() {} });
 		try {
-			await assertRejects(() => hub.subscribe(connection, "relay://"), PermissionDeniedError);
-			await assertRejects(() => hub.execFrom(connection, "relay://", "read", {}), PermissionDeniedError);
-			await assertRejects(() => hub.subscribe(connection, "state://"), PermissionDeniedError);
-			assertEquals(await hub.subscribe(connection, "open://"), undefined);
-			assertEquals(await hub.execFrom(connection, "open://", "read", {}), null);
-			assertEquals(await hub.reconnect(connection, 0, ["relay://", "open://"]), { type: "replay", actions: [], missing: ["relay://"] });
-			assertEquals(seen, [undefined, undefined, 0, undefined]);
+			await rejects(() => hub.subscribe(connection, "relay://"), PermissionDeniedError);
+			await rejects(() => hub.execFrom(connection, "relay://", "read", {}), PermissionDeniedError);
+			await rejects(() => hub.subscribe(connection, "state://"), PermissionDeniedError);
+			deepStrictEqual(await hub.subscribe(connection, "open://"), undefined);
+			deepStrictEqual(await hub.execFrom(connection, "open://", "read", {}), null);
+			deepStrictEqual(await hub.reconnect(connection, 0, ["relay://", "open://"]), { type: "replay", actions: [], missing: ["relay://"] });
+			deepStrictEqual(seen, [undefined, undefined, 0, undefined]);
 		} finally {
 			await hub.close();
 		}
@@ -138,19 +171,21 @@ describe("channel authorization", () => {
 
 	it("rejects hello and subsequent subscriptions through RPC and drops denied re-subscriptions", async () => {
 		let allowed = false;
-		const host = boot(() => allowed ? Permission.All : Permission.None);
+		const host = boot(() => (allowed ? Permission.All : Permission.None));
 		const { client, loop } = host.serve("remote");
 		try {
-			const error = await assertRejects(() => client.hello({ subscriptions: ["counter://"] }), RpcError);
-			assertEquals(error.code, -32009);
+			await rejects(
+				() => client.hello({ subscriptions: ["counter://"] }),
+				(error) => error instanceof RpcError && error.code === -32009,
+			);
 			await client.hello();
-			await assertRejects(() => client.subscribe("counter://"), RpcError);
+			await rejects(() => client.subscribe("counter://"), RpcError);
 			allowed = true;
 			await host.hub.subscribe(host.connection, "counter://");
 			allowed = false;
-			await assertRejects(() => host.hub.subscribe(host.connection, "counter://"), PermissionDeniedError);
+			await rejects(() => host.hub.subscribe(host.connection, "counter://"), PermissionDeniedError);
 			await host.hub.dispatch("counter://", "add", {});
-			assertEquals(host.messages, []);
+			deepStrictEqual(host.messages, []);
 		} finally {
 			await client.shutdown();
 			await loop;
@@ -163,10 +198,10 @@ describe("channel authorization", () => {
 		const host = boot(async (ctx, request) => {
 			const state: State = await ctx.state();
 			const role: "reader" | "writer" | undefined = ctx.principal?.role;
-			assertEquals(ctx.env.effects, state.count);
-			assertEquals(ctx.uri, "counter:/one");
-			assertEquals(ctx.params, { id: "one" });
-			assertEquals(ctx.connectionId, role ? "tab" : "guest");
+			deepStrictEqual(ctx.env.effects, state.count);
+			deepStrictEqual(ctx.uri, "counter:/one");
+			deepStrictEqual(ctx.params, { id: "one" });
+			deepStrictEqual(ctx.connectionId, role ? "tab" : "guest");
 			seen.push(request);
 			return role === "writer" ? Permission.Subscribe | Permission.Dispatch : Permission.Execute;
 		});
@@ -174,16 +209,16 @@ describe("channel authorization", () => {
 			await host.hub.create("counter:/one");
 			const guest = host.hub.connect({ id: "guest", send() {} });
 			await host.hub.subscribe(host.connection, "counter:/one");
-			assertEquals((await host.hub.dispatchFrom(host.connection, "counter:/one", "add", {}, 1))?.rejectionReason, undefined);
-			await assertRejects(() => host.hub.execFrom(host.connection, "counter:/one", "read", {}), PermissionDeniedError);
-			await assertRejects(() => host.hub.subscribe(guest, "counter:/one"), PermissionDeniedError);
-			assertEquals(await host.hub.execFrom(guest, "counter:/one", "read", {}), 1);
-			assertEquals(
+			deepStrictEqual((await host.hub.dispatchFrom(host.connection, "counter:/one", "add", {}, 1))?.rejectionReason, undefined);
+			await rejects(() => host.hub.execFrom(host.connection, "counter:/one", "read", {}), PermissionDeniedError);
+			await rejects(() => host.hub.subscribe(guest, "counter:/one"), PermissionDeniedError);
+			deepStrictEqual(await host.hub.execFrom(guest, "counter:/one", "read", {}), 1);
+			deepStrictEqual(
 				(await host.hub.dispatchFrom(guest, "counter:/one", "add", {}, 1))?.rejectionReason,
 				"PERMISSION_DENIED: Permission denied",
 			);
-			assertEquals(host.env, { effects: 1, commands: 1 });
-			assertEquals(seen, [
+			deepStrictEqual(host.env, { effects: 1, commands: 1 });
+			deepStrictEqual(seen, [
 				{ type: "subscribe" },
 				{ type: "action", name: "add", payload: { by: 1 } },
 				{ type: "command", name: "read", params: { label: "default" } },
@@ -204,14 +239,14 @@ describe("channel authorization", () => {
 		});
 		try {
 			await host.hub.dispatch("counter://", "add", {});
-			assertEquals(await host.hub.exec("counter://", "read", {}), 1);
-			assertEquals(calls, 0);
-			assertEquals(await host.hub.execFrom(host.connection, "counter://", "nested", {}), 0);
-			assertEquals(calls, 1);
-			await assertRejects(() => host.hub.subscribe(host.connection, "private://"), RouteNotFoundError);
-			await assertRejects(() => host.hub.execFrom(host.connection, "private://", "read", {}), RouteNotFoundError);
-			await assertRejects(() => host.hub.dispatchFrom(host.connection, "counter://", "server", {}, 1), NotClientDispatchableError);
-			assertEquals(calls, 1);
+			deepStrictEqual(await host.hub.exec("counter://", "read", {}), 1);
+			deepStrictEqual(calls, 0);
+			deepStrictEqual(await host.hub.execFrom(host.connection, "counter://", "nested", {}), 0);
+			deepStrictEqual(calls, 1);
+			await rejects(() => host.hub.subscribe(host.connection, "private://"), RouteNotFoundError);
+			await rejects(() => host.hub.execFrom(host.connection, "private://", "read", {}), RouteNotFoundError);
+			await rejects(() => host.hub.dispatchFrom(host.connection, "counter://", "server", {}, 1), NotClientDispatchableError);
+			deepStrictEqual(calls, 1);
 		} finally {
 			await host.hub.close();
 		}
@@ -220,20 +255,20 @@ describe("channel authorization", () => {
 	for (const replayLimit of [0, 10]) {
 		it(`withholds unauthorized subscriptions from reconnect (${replayLimit ? "replay" : "snapshot"})`, async () => {
 			let allowed = true;
-			const host = boot(() => allowed ? Permission.All : Permission.None, replayLimit);
+			const host = boot(() => (allowed ? Permission.All : Permission.None), replayLimit);
 			try {
 				await host.hub.subscribe(host.connection, "counter://");
 				await host.hub.dispatch("counter://", "add", {});
 				await host.hub.dispatch("counter://", "add", {});
 				allowed = false;
 				const result = await host.hub.reconnect(host.connection, 0, ["counter://"]);
-				assertEquals(result.missing, ["counter://"]);
-				assertEquals(result.type, replayLimit ? "replay" : "snapshot");
-				assertEquals(result.type === "replay" ? result.actions : result.snapshots, []);
+				deepStrictEqual(result.missing, ["counter://"]);
+				deepStrictEqual(result.type, replayLimit ? "replay" : "snapshot");
+				deepStrictEqual(result.type === "replay" ? result.actions : result.snapshots, []);
 				host.messages.length = 0;
 				await host.hub.dispatch("counter://", "add", {});
 				await host.hub.notify("counter://", "notice", "secret");
-				assertEquals(host.messages, []);
+				deepStrictEqual(host.messages, []);
 			} finally {
 				await host.hub.close();
 			}
@@ -241,17 +276,17 @@ describe("channel authorization", () => {
 	}
 
 	it("evaluates state-dependent action permissions in commit order", async () => {
-		const host = boot(async (ctx) => (await ctx.state()).count < 1 ? Permission.All : Permission.None);
+		const host = boot(async (ctx) => ((await ctx.state()).count < 1 ? Permission.All : Permission.None));
 		try {
 			await host.hub.subscribe(host.connection, "counter://");
 			const [first, second] = await Promise.all([
 				host.hub.dispatchFrom(host.connection, "counter://", "add", {}, 1),
 				host.hub.dispatchFrom(host.connection, "counter://", "add", {}, 2),
 			]);
-			assertEquals(first?.rejectionReason, undefined);
-			assertEquals(second?.rejectionReason, "PERMISSION_DENIED: Permission denied");
-			assertEquals(await host.hub.get("counter://"), { count: 1 });
-			assertEquals(host.env.effects, 1);
+			deepStrictEqual(first?.rejectionReason, undefined);
+			deepStrictEqual(second?.rejectionReason, "PERMISSION_DENIED: Permission denied");
+			deepStrictEqual(await host.hub.get("counter://"), { count: 1 });
+			deepStrictEqual(host.env.effects, 1);
 		} finally {
 			await host.hub.close();
 		}
@@ -267,18 +302,19 @@ describe("channel authorization", () => {
 				return Permission.All;
 			});
 			try {
-				const pending = operation === "subscribe"
-					? host.hub.subscribe(host.connection, "counter://")
-					: operation === "action"
-					? host.hub.dispatchFrom(host.connection, "counter://", "add", {}, 1)
-					: host.hub.execFrom(host.connection, "counter://", "read", {});
-				const rejected = assertRejects(() => pending, ConnectionNotFoundError);
+				const pending =
+					operation === "subscribe"
+						? host.hub.subscribe(host.connection, "counter://")
+						: operation === "action"
+							? host.hub.dispatchFrom(host.connection, "counter://", "add", {}, 1)
+							: host.hub.execFrom(host.connection, "counter://", "read", {});
+				const rejected = rejects(() => pending, ConnectionNotFoundError);
 				await entered.promise;
 				host.hub.connect({ id: "tab", principal: { id: "alice", role: "writer" }, send() {} });
 				resume.release();
 				await rejected;
-				assertEquals(host.env, { effects: 0, commands: 0 });
-				assertEquals(host.hub.serverSeq, 0);
+				deepStrictEqual(host.env, { effects: 0, commands: 0 });
+				deepStrictEqual(host.hub.serverSeq, 0);
 			} finally {
 				resume.release();
 				await host.hub.close();
@@ -293,13 +329,13 @@ describe("channel authorization", () => {
 				return value as number;
 			});
 			try {
-				await assertRejects(() => host.hub.subscribe(host.connection, "counter://"), PermissionDeniedError);
-				await assertRejects(() => host.hub.execFrom(host.connection, "counter://", "read", {}), PermissionDeniedError);
-				assertEquals(
+				await rejects(() => host.hub.subscribe(host.connection, "counter://"), PermissionDeniedError);
+				await rejects(() => host.hub.execFrom(host.connection, "counter://", "read", {}), PermissionDeniedError);
+				deepStrictEqual(
 					(await host.hub.dispatchFrom(host.connection, "counter://", "add", {}, 1))?.rejectionReason,
 					"PERMISSION_DENIED: Permission denied",
 				);
-				assertEquals(host.env, { effects: 0, commands: 0 });
+				deepStrictEqual(host.env, { effects: 0, commands: 0 });
 			} finally {
 				await host.hub.close();
 			}
@@ -310,7 +346,7 @@ describe("channel authorization", () => {
 		const resume = gate();
 		let actionChecks = 0;
 		const host = boot(async (ctx, request) => {
-			assert(ctx.env !== undefined);
+			ok(ctx.env !== undefined);
 			if (request.type === "command") return Permission.None;
 			if (request.type === "action") {
 				actionChecks++;
@@ -324,18 +360,20 @@ describe("channel authorization", () => {
 			await client.hello({ subscriptions: ["counter://"] });
 			const refused = client.dispatch("counter://", "add", { by: 5 });
 			const accepted = client.dispatch("counter://", "add", { by: 2 });
-			assertEquals(client.state("counter://"), { count: 7 });
-			assertEquals(client.confirmed("counter://"), { count: 0 });
-			assertEquals(actionChecks, 0);
+			deepStrictEqual(client.state("counter://"), { count: 7 });
+			deepStrictEqual(client.confirmed("counter://"), { count: 0 });
+			deepStrictEqual(actionChecks, 0);
 			resume.release();
-			assertEquals((await refused.settled).status, "rejected");
-			assertEquals((await accepted.settled).status, "confirmed");
-			assertEquals(client.state("counter://"), { count: 2 });
-			assertEquals(client.confirmed("counter://"), await host.hub.get("counter://"));
-			assertEquals(client.pending("counter://"), []);
-			assertEquals(actionChecks, 2);
-			const error = await assertRejects(() => client.exec("counter://", "read", {}), RpcError);
-			assertEquals(error.code, -32009);
+			deepStrictEqual((await refused.settled).status, "rejected");
+			deepStrictEqual((await accepted.settled).status, "confirmed");
+			deepStrictEqual(client.state("counter://"), { count: 2 });
+			deepStrictEqual(client.confirmed("counter://"), await host.hub.get("counter://"));
+			deepStrictEqual(client.pending("counter://"), []);
+			deepStrictEqual(actionChecks, 2);
+			await rejects(
+				() => client.exec("counter://", "read", {}),
+				(error) => error instanceof RpcError && error.code === -32009,
+			);
 		} finally {
 			resume.release();
 			await client.shutdown();

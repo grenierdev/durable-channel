@@ -1,11 +1,10 @@
-import { describe, it } from "node:test";
-import { assert, assertEquals } from "@std/assert";
+import { deepStrictEqual, ok } from "node:assert/strict";
 import * as v from "valibot";
-import { durableChannel, type DurableChannelMessage } from "./channel.ts";
-import { durableRoutes } from "./routes.ts";
-import { type DurableChannelConnection, DurableChannelHub } from "./hub.ts";
-import { MemoryStorage } from "./storage.ts";
+import { describe, it } from "vitest";
+import { type DurableChannelMessage, durableChannel } from "./channel.ts";
 import { RejectAction } from "./error.ts";
+import { type DurableChannelConnection, DurableChannelHub } from "./hub.ts";
+import { durableRoutes } from "./routes.ts";
 import {
 	attachSocket,
 	createRpc,
@@ -14,6 +13,7 @@ import {
 	fromRpcNotification,
 	toRpcNotification,
 } from "./rpc.ts";
+import { MemoryStorage } from "./storage.ts";
 
 type Env = { now(): string };
 
@@ -21,7 +21,8 @@ const tally = durableChannel()
 	.env<Env>()
 	.state(v.object({ count: v.number() }), { count: 0 })
 	.action((a) =>
-		a.name("tally/added")
+		a
+			.name("tally/added")
 			.payload(v.object({ by: v.pipe(v.number(), v.integer()) }))
 			.client()
 			.reduce((state, payload) => {
@@ -29,25 +30,32 @@ const tally = durableChannel()
 					throw new RejectAction("by must be positive");
 				}
 				return { count: state.count + payload.by };
-			})
+			}),
 	)
-	.action((a) => a.name("tally/set").payload(v.object({ to: v.number() })).reduce((_state, payload) => ({ count: payload.to })))
+	.action((a) =>
+		a
+			.name("tally/set")
+			.payload(v.object({ to: v.number() }))
+			.reduce((_state, payload) => ({ count: payload.to })),
+	)
 	.command((c) =>
-		c.name("open")
+		c
+			.name("open")
 			.params(v.object({ id: v.string() }))
 			.result(v.object({ uri: v.string(), by: v.string() }))
 			.handler(async ({ id }, ctx) => {
 				await ctx.create(`note:/${id}`);
 				return { uri: `note:/${id}`, by: ctx.connectionId ?? "server" };
-			})
+			}),
 	)
 	.command((c) =>
-		c.name("refuse")
+		c
+			.name("refuse")
 			.params(v.object({}))
 			.result(v.null())
 			.handler(() => {
 				throw new RejectAction("never");
-			})
+			}),
 	)
 	.notification((n) => n.name("tally/said").payload(v.object({ text: v.string() })))
 	.build();
@@ -55,19 +63,26 @@ const tally = durableChannel()
 const note = durableChannel()
 	.env<Env>()
 	.state(v.object({ title: v.string() }), { title: "untitled" })
-	.action((a) => a.name("note/titled").payload(v.object({ title: v.string() })).client().reduce((_s, p) => ({ title: p.title })))
+	.action((a) =>
+		a
+			.name("note/titled")
+			.payload(v.object({ title: v.string() }))
+			.client()
+			.reduce((_s, p) => ({ title: p.title })),
+	)
 	.build();
 
 const feed = durableChannel()
 	.env<Env>()
 	.command((c) =>
-		c.name("say")
+		c
+			.name("say")
 			.params(v.object({ line: v.string() }))
 			.result(v.null())
 			.handler(async ({ line }, ctx) => {
 				await ctx.notify(ctx.uri, "feed/line", { line, at: ctx.env.now() });
 				return null;
-			})
+			}),
 	)
 	.notification((n) => n.name("feed/line").payload(v.object({ line: v.string(), at: v.string() })))
 	.build();
@@ -128,7 +143,7 @@ function boot(options?: { replayLimit?: number }) {
 }
 
 function result(response: unknown): unknown {
-	assert(
+	ok(
 		response !== undefined && response !== null && typeof response === "object" && "result" in response,
 		`expected a result, got ${JSON.stringify(response)}`,
 	);
@@ -136,7 +151,7 @@ function result(response: unknown): unknown {
 }
 
 function error(response: unknown): { code: number; message: string; data?: unknown } {
-	assert(
+	ok(
 		response !== undefined && response !== null && typeof response === "object" && "error" in response,
 		`expected an error, got ${JSON.stringify(response)}`,
 	);
@@ -183,14 +198,14 @@ describe("rpc", () => {
 		try {
 			await host.hub.create("note:/1", { title: "Draft" });
 			const response = await host.call("hello", { clientId: "alice", subscriptions: ["tally://", "note:/1", "feed:/live"] });
-			assertEquals(result(response), {
+			deepStrictEqual(result(response), {
 				serverSeq: 0,
 				snapshots: [
 					{ resource: "tally://", state: { count: 0 }, fromSeq: 0 },
 					{ resource: "note:/1", state: { title: "Draft" }, fromSeq: 0 },
 				],
 			});
-			assertEquals(host.link.clientId, "alice");
+			deepStrictEqual(host.link.clientId, "alice");
 		} finally {
 			await host.hub.close();
 		}
@@ -199,9 +214,9 @@ describe("rpc", () => {
 	it("answers a ping before hello and refuses every other method until the link is bound", async () => {
 		const host = boot();
 		try {
-			assertEquals(result(await host.call("ping")), null);
-			assertEquals(error(await host.call("subscribe", { channel: "tally://" })).code, DurableChannelRpcErrorCodes.NotInitialized);
-			assertEquals(error(await host.call("exec", { channel: "tally://", name: "refuse", params: {} })).code, -32003);
+			deepStrictEqual(result(await host.call("ping")), null);
+			deepStrictEqual(error(await host.call("subscribe", { channel: "tally://" })).code, DurableChannelRpcErrorCodes.NotInitialized);
+			deepStrictEqual(error(await host.call("exec", { channel: "tally://", name: "refuse", params: {} })).code, -32003);
 		} finally {
 			await host.hub.close();
 		}
@@ -211,10 +226,10 @@ describe("rpc", () => {
 		const host = boot();
 		try {
 			await host.call("hello", { clientId: "alice" });
-			assertEquals(result(await host.call("subscribe", { channel: "tally://" })), {
+			deepStrictEqual(result(await host.call("subscribe", { channel: "tally://" })), {
 				snapshot: { resource: "tally://", state: { count: 0 }, fromSeq: 0 },
 			});
-			assertEquals(result(await host.call("subscribe", { channel: "feed:/live" })), {});
+			deepStrictEqual(result(await host.call("subscribe", { channel: "feed:/live" })), {});
 		} finally {
 			await host.hub.close();
 		}
@@ -232,12 +247,12 @@ describe("rpc", () => {
 				serverSeq: 1,
 				origin: { clientId: "alice", clientSeq: 1 },
 			};
-			assertEquals(
+			deepStrictEqual(
 				result(await host.call("dispatch", { channel: "tally://", clientSeq: 1, name: "tally/added", payload: { by: 2 } })),
 				envelope,
 			);
-			assertEquals(host.sent, [envelope]);
-			assertEquals(await host.hub.get("tally://"), { count: 2 });
+			deepStrictEqual(host.sent, [envelope]);
+			deepStrictEqual(await host.hub.get("tally://"), { count: 2 });
 		} finally {
 			await host.hub.close();
 		}
@@ -248,12 +263,12 @@ describe("rpc", () => {
 		try {
 			await host.call("hello", { clientId: "alice", subscriptions: ["tally://"] });
 			await host.call("dispatch", { channel: "tally://", clientSeq: 4, name: "tally/added", payload: { by: 1 } });
-			assertEquals(
+			deepStrictEqual(
 				result(await host.call("dispatch", { channel: "tally://", clientSeq: 4, name: "tally/added", payload: { by: 1 } })),
 				null,
 			);
-			assertEquals(await host.hub.get("tally://"), { count: 1 });
-			assertEquals(host.sent.length, 1);
+			deepStrictEqual(await host.hub.get("tally://"), { count: 1 });
+			deepStrictEqual(host.sent.length, 1);
 		} finally {
 			await host.hub.close();
 		}
@@ -264,27 +279,23 @@ describe("rpc", () => {
 		try {
 			await host.call("hello", { clientId: "alice", subscriptions: ["tally://"] });
 			const reasons: (string | undefined)[] = [];
-			for (
-				const [index, attempt] of [
-					{ name: "tally/nope", payload: {} },
-					{ name: "tally/set", payload: { to: 3 } },
-					{ name: "tally/added", payload: { by: "two" } },
-					{ name: "tally/added", payload: { by: -1 } },
-				].entries()
-			) {
+			for (const [index, attempt] of [
+				{ name: "tally/nope", payload: {} },
+				{ name: "tally/set", payload: { to: 3 } },
+				{ name: "tally/added", payload: { by: "two" } },
+				{ name: "tally/added", payload: { by: -1 } },
+			].entries()) {
 				const envelope = result(await host.call("dispatch", { channel: "tally://", clientSeq: index + 1, ...attempt })) as {
 					rejectionReason?: string;
 				};
 				reasons.push(envelope.rejectionReason);
 			}
-			assertEquals(reasons.map((reason) => reason?.split(":")[0]), [
-				"UNKNOWN_ACTION",
-				"NOT_CLIENT_DISPATCHABLE",
-				"INVALID_PAYLOAD",
-				"by must be positive",
-			]);
-			assertEquals(await host.hub.get("tally://"), { count: 0 });
-			assertEquals(host.sent.length, 4);
+			deepStrictEqual(
+				reasons.map((reason) => reason?.split(":")[0]),
+				["UNKNOWN_ACTION", "NOT_CLIENT_DISPATCHABLE", "INVALID_PAYLOAD", "by must be positive"],
+			);
+			deepStrictEqual(await host.hub.get("tally://"), { count: 0 });
+			deepStrictEqual(host.sent.length, 4);
 		} finally {
 			await host.hub.close();
 		}
@@ -294,11 +305,11 @@ describe("rpc", () => {
 		const host = boot();
 		try {
 			await host.call("hello", { clientId: "alice" });
-			assertEquals(result(await host.call("exec", { channel: "tally://", name: "open", params: { id: "7" } })), {
+			deepStrictEqual(result(await host.call("exec", { channel: "tally://", name: "open", params: { id: "7" } })), {
 				uri: "note:/7",
 				by: "alice",
 			});
-			assertEquals(error(await host.call("exec", { channel: "tally://", name: "refuse", params: {} })), {
+			deepStrictEqual(error(await host.call("exec", { channel: "tally://", name: "refuse", params: {} })), {
 				code: DurableChannelRpcErrorCodes.ActionRejected,
 				message: "ACTION_REJECTED: never",
 				data: { reason: "never" },
@@ -312,24 +323,24 @@ describe("rpc", () => {
 		const host = boot();
 		try {
 			await host.call("hello", { clientId: "alice" });
-			assertEquals(error(await host.call("subscribe", { channel: "nope://" })).code, DurableChannelRpcErrorCodes.ChannelNotFound);
-			assertEquals(error(await host.call("subscribe", { channel: "note:/9" })).code, DurableChannelRpcErrorCodes.ChannelNotFound);
-			assertEquals(error(await host.call("subscribe", { channel: "x-secret://" })).code, DurableChannelRpcErrorCodes.ChannelNotFound);
-			assertEquals(
+			deepStrictEqual(error(await host.call("subscribe", { channel: "nope://" })).code, DurableChannelRpcErrorCodes.ChannelNotFound);
+			deepStrictEqual(error(await host.call("subscribe", { channel: "note:/9" })).code, DurableChannelRpcErrorCodes.ChannelNotFound);
+			deepStrictEqual(error(await host.call("subscribe", { channel: "x-secret://" })).code, DurableChannelRpcErrorCodes.ChannelNotFound);
+			deepStrictEqual(
 				error(await host.call("exec", { channel: "tally://", name: "ghost", params: {} })).code,
 				DurableChannelRpcErrorCodes.MethodNotFound,
 			);
-			assertEquals(
+			deepStrictEqual(
 				error(await host.call("exec", { channel: "tally://", name: "open", params: {} })).code,
 				DurableChannelRpcErrorCodes.InvalidParams,
 			);
 			await host.call("exec", { channel: "tally://", name: "open", params: { id: "1" } });
-			assertEquals(
+			deepStrictEqual(
 				error(await host.call("exec", { channel: "tally://", name: "open", params: { id: "1" } })).code,
 				DurableChannelRpcErrorCodes.ChannelAlreadyExists,
 			);
-			assertEquals(error(await host.call("hello", { clientId: "" })).code, DurableChannelRpcErrorCodes.InvalidParams);
-			assertEquals(error(await host.call("ghost")).code, DurableChannelRpcErrorCodes.MethodNotFound);
+			deepStrictEqual(error(await host.call("hello", { clientId: "" })).code, DurableChannelRpcErrorCodes.InvalidParams);
+			deepStrictEqual(error(await host.call("ghost")).code, DurableChannelRpcErrorCodes.MethodNotFound);
 		} finally {
 			await host.hub.close();
 		}
@@ -339,10 +350,14 @@ describe("rpc", () => {
 		const host = boot();
 		try {
 			await host.call("hello", { clientId: "alice", subscriptions: ["tally://"] });
-			assertEquals(await host.call("unsubscribe", { channel: "tally://" }, "notification"), undefined);
+			deepStrictEqual(await host.call("unsubscribe", { channel: "tally://" }, "notification"), undefined);
 			await host.hub.dispatch("tally://", "tally/set", { to: 5 });
-			assertEquals(host.sent, []);
-			assertEquals(await host.raw({ hello: "there" }), { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } });
+			deepStrictEqual(host.sent, []);
+			deepStrictEqual(await host.raw({ hello: "there" }), {
+				jsonrpc: "2.0",
+				id: null,
+				error: { code: -32600, message: "Invalid Request" },
+			});
 		} finally {
 			await host.hub.close();
 		}
@@ -354,14 +369,14 @@ describe("rpc", () => {
 			await host.call("hello", { clientId: "alice", subscriptions: ["tally://"] });
 			await host.hub.dispatch("tally://", "tally/set", { to: 4 });
 			host.sent.splice(0);
-			assertEquals(
+			deepStrictEqual(
 				result(
 					await host.call("reconnect", { clientId: "alice", lastSeenServerSeq: 1, subscriptions: ["tally://", "note:/9", "feed:/live"] }),
 				),
 				{ type: "replay", actions: [], missing: ["note:/9"] },
 			);
 			await host.hub.dispatch("tally://", "tally/set", { to: 6 });
-			assertEquals(host.sent.length, 1);
+			deepStrictEqual(host.sent.length, 1);
 		} finally {
 			await host.hub.close();
 		}
@@ -373,7 +388,7 @@ describe("rpc", () => {
 			await host.call("hello", { clientId: "alice", subscriptions: ["tally://"] });
 			await host.hub.dispatch("tally://", "tally/set", { to: 1 });
 			await host.hub.dispatch("tally://", "tally/set", { to: 2 });
-			assertEquals(result(await host.call("reconnect", { clientId: "alice", lastSeenServerSeq: 0, subscriptions: ["tally://"] })), {
+			deepStrictEqual(result(await host.call("reconnect", { clientId: "alice", lastSeenServerSeq: 0, subscriptions: ["tally://"] })), {
 				type: "snapshot",
 				snapshots: [{ resource: "tally://", state: { count: 2 }, fromSeq: 2 }],
 				missing: [],
@@ -393,16 +408,16 @@ describe("rpc", () => {
 			origin: { clientId: "alice", clientSeq: 1 },
 		} as const;
 		const frame = toRpcNotification(envelope);
-		assertEquals(frame, {
+		deepStrictEqual(frame, {
 			jsonrpc: "2.0",
 			method: "action",
 			params: { channel: "tally://", name: "tally/added", payload: { by: 1 }, serverSeq: 3, origin: { clientId: "alice", clientSeq: 1 } },
 		});
-		assertEquals(fromRpcNotification("action", frame.params), envelope);
+		deepStrictEqual(fromRpcNotification("action", frame.params), envelope);
 		const notification = { type: "notification", channel: "feed:/live", name: "feed/line", payload: { line: "hi" } } as const;
-		assertEquals(fromRpcNotification("notification", toRpcNotification(notification).params), notification);
-		assertEquals(fromRpcNotification("action", { channel: 12 }), undefined);
-		assertEquals(fromRpcNotification("something/else", {}), undefined);
+		deepStrictEqual(fromRpcNotification("notification", toRpcNotification(notification).params), notification);
+		deepStrictEqual(fromRpcNotification("action", { channel: 12 }), undefined);
+		deepStrictEqual(fromRpcNotification("something/else", {}), undefined);
 	});
 
 	it("serves a socket in arrival order, refuses an undecodable frame and detaches when it closes", async () => {
@@ -425,14 +440,17 @@ describe("rpc", () => {
 			);
 			wire.fire("message", "{ not json");
 			await flush();
-			assertEquals(session.link.clientId, "alice");
+			deepStrictEqual(session.link.clientId, "alice");
 			const decoded = wire.frames.map((frame) => JSON.parse(frame) as { id?: number | null; method?: string; error?: { code: number } });
-			assertEquals(decoded.map((frame) => frame.method ?? frame.id), [1, "action", 2, null]);
-			assertEquals(decoded[3].error?.code, -32700);
-			assertEquals(await host.hub.get("tally://"), { count: 3 });
+			deepStrictEqual(
+				decoded.map((frame) => frame.method ?? frame.id),
+				[1, "action", 2, null],
+			);
+			deepStrictEqual(decoded[3].error?.code, -32700);
+			deepStrictEqual(await host.hub.get("tally://"), { count: 3 });
 			wire.fire("close");
 			await host.hub.dispatch("tally://", "tally/set", { to: 0 });
-			assertEquals(wire.frames.length, 4);
+			deepStrictEqual(wire.frames.length, 4);
 		} finally {
 			session.detach();
 			await host.hub.close();

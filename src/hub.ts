@@ -16,8 +16,6 @@
  * {@link DurableChannelHub.close}, so nothing keeps running after a hub is shut down.
  */
 import { type GenericSchema, type InferInput, type InferOutput, safeParse } from "valibot";
-import { describeRoutes, type DurableChannelDocument, type DurableChannelDocumentOptions } from "./document.ts";
-import { DurableChannelPermission } from "./channel.ts";
 import type {
 	DurableChannel,
 	DurableChannelActionDefinition,
@@ -35,6 +33,8 @@ import type {
 	DurableChannelReconnectResult,
 	DurableChannelSnapshot,
 } from "./channel.ts";
+import { DurableChannelPermission } from "./channel.ts";
+import { type DurableChannelDocument, type DurableChannelDocumentOptions, describeRoutes } from "./document.ts";
 import {
 	ChannelAlreadyExistsError,
 	ChannelNotFoundError,
@@ -262,7 +262,8 @@ export class DurableChannelHub<
 	connect(options: DurableChannelConnectionOptions<TPrincipal>): DurableChannelConnection<TPrincipal> {
 		const principal = options.principal === undefined ? undefined : Object.freeze({ ...options.principal });
 		if (
-			typeof options.id !== "string" || !options.id ||
+			typeof options.id !== "string" ||
+			!options.id ||
 			(principal !== undefined && (typeof principal.id !== "string" || principal.id.length === 0))
 		) {
 			throw new PermissionDeniedError();
@@ -298,7 +299,9 @@ export class DurableChannelHub<
 		link.subscriptions.clear();
 		try {
 			link.onDisconnect?.();
-		} catch { /* Host cleanup must not break registration or a commit. */ }
+		} catch {
+			/* Host cleanup must not break registration or a commit. */
+		}
 	}
 
 	/**
@@ -501,11 +504,17 @@ export class DurableChannelHub<
 	): Promise<unknown> {
 		this.#link(connection);
 		this.#reachable(uri);
-		return await this.#exec(uri, name, params, {
-			connectionId: connection.id,
-			...(connection.principal === undefined ? {} : { principal: connection.principal }),
-			...(options?.signal === undefined ? {} : { signal: options.signal }),
-		}, connection);
+		return await this.#exec(
+			uri,
+			name,
+			params,
+			{
+				connectionId: connection.id,
+				...(connection.principal === undefined ? {} : { principal: connection.principal }),
+				...(options?.signal === undefined ? {} : { signal: options.signal }),
+			},
+			connection,
+		);
 	}
 
 	async #exec(
@@ -582,7 +591,7 @@ export class DurableChannelHub<
 		if (match.route.definition.state === undefined || this.#instances.has(uri) || isSingleton(match.route)) {
 			return true;
 		}
-		return await this.#storage.get(["channel", match.route.template, uri]) !== undefined;
+		return (await this.#storage.get(["channel", match.route.template, uri])) !== undefined;
 	}
 
 	/** Creates an instance of a parameterized route. `state` defaults to the definition's initial state. */
@@ -751,20 +760,25 @@ export class DurableChannelHub<
 		if (authorize === undefined) return;
 		let permissions: number = DurableChannelPermission.None;
 		try {
-			permissions = await authorize({
-				env: this.#env,
-				uri,
-				params: match.params,
-				connectionId: connection.id,
-				principal: connection.principal,
-				state: () => match.route.definition.state === undefined ? Promise.resolve(undefined) : this.get(uri),
-			}, request);
+			permissions = await authorize(
+				{
+					env: this.#env,
+					uri,
+					params: match.params,
+					connectionId: connection.id,
+					principal: connection.principal,
+					state: () => (match.route.definition.state === undefined ? Promise.resolve(undefined) : this.get(uri)),
+				},
+				request,
+			);
 		} catch {
 			// A failed policy never admits an operation or exposes server exception details to a peer.
 		}
 		this.#link(connection);
 		if (
-			!Number.isInteger(permissions) || permissions < 0 || permissions > DurableChannelPermission.All ||
+			!Number.isInteger(permissions) ||
+			permissions < 0 ||
+			permissions > DurableChannelPermission.All ||
 			(permissions & permission) !== permission
 		) {
 			throw new PermissionDeniedError();
@@ -917,10 +931,12 @@ export class DurableChannelHub<
 			await action.effect({
 				...this.#operations(
 					instance.uri,
-					connection === undefined ? undefined : {
-						connectionId: connection.id,
-						...(connection.principal === undefined ? {} : { principal: connection.principal }),
-					},
+					connection === undefined
+						? undefined
+						: {
+								connectionId: connection.id,
+								...(connection.principal === undefined ? {} : { principal: connection.principal }),
+							},
 				),
 				uri: instance.uri,
 				params: instance.params,
@@ -950,7 +966,10 @@ export class DurableChannelHub<
 
 	#withLock<T>(task: () => Promise<T>): Promise<T> {
 		const run = this.#lock.then(task, task);
-		this.#lock = run.then(() => undefined, () => undefined);
+		this.#lock = run.then(
+			() => undefined,
+			() => undefined,
+		);
 		return run;
 	}
 }
