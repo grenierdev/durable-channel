@@ -881,7 +881,7 @@ before `["a", "b", "c"]`, a page carries a `cursor` only when an entry really fo
 cannot be reached again through the object that wrote it. SQLite serializes values as JSON and indexes keys in segment-wise order for
 prefix scans. Database operations use Node’s synchronous SQLite API behind the asynchronous storage interface.
 `SqliteStorage` is a separate Node-only entry point; importing the core library never loads `node:sqlite`. Close the hub
-before disposing its storage. Existing KV databases must be exported and imported into SQLite; the database formats differ.
+before disposing its storage.
 
 ## Errors
 

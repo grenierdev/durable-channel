@@ -1,8 +1,7 @@
 ---
 title: Build your first channel
 description: Define a counter, mount it at a URI, start a hub, and commit the first action.
-section: Start
-order: 2
+order: 1
 visual: definition
 ---
 
@@ -14,7 +13,6 @@ Install the published package, then import it by name:
 
 ```sh
 npm install durable-channel
-# or: deno add npm:durable-channel
 ```
 
 ```ts
@@ -87,4 +85,4 @@ await hub.get("counter://"); // { count: 2 }
 
 Payloads are parsed before the reducer runs, and the reducer result is validated against the state schema before persistence. A `RejectAction` still produces an ordered envelope, but leaves state unchanged and carries a `rejectionReason`.
 
-Continue with [Core concepts](/docs/core-concepts) to see how state, actions, commands, and notifications divide responsibility.
+Continue with [Core concepts](/docs/concepts/primitives) to see how state, actions, commands, and notifications divide responsibility.

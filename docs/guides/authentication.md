@@ -1,8 +1,7 @@
 ---
 title: Authentication and authorization
 description: Attach trusted identity to connections and authorize subscriptions, actions, and commands at the channel boundary.
-section: Build
-order: 6
+order: 1
 visual: auth
 ---
 
@@ -46,24 +45,28 @@ const routes = durableRoutes()
 
 ## Attach identity at the host boundary
 
-Authenticate the HTTP request and check its allowed `Origin` before a browser WebSocket upgrade. Pass only the verified principal to `attachSocket`; never accept identity from a client frame.
+Authenticate the HTTP request and check its allowed `Origin` before a browser WebSocket upgrade. Pass only the verified principal to `attachSocket`; never accept identity from a client frame. The example serves the socket on Node.js with `@hono/node-server` and `ws`.
 
 ```ts
-async function handleUpgrade(request: Request): Promise<Response> {
-  if (!isAllowedOrigin(request)) return new Response("Forbidden", { status: 403 });
+import { serve, upgradeWebSocket } from "@hono/node-server";
+import { Hono } from "hono";
+import { WebSocketServer, type WebSocket } from "ws";
 
+const app = new Hono();
+
+app.get("/rpc", async (context, next) => {
+  const request = context.req.raw;
+  if (!isAllowedOrigin(request)) return context.text("Forbidden", 403);
   const principal: Principal | undefined = await readSession(request);
-  const { socket, response } = Deno.upgradeWebSocket(request);
-  const session = attachSocket(
-    rpc,
-    hub,
-    socket,
-    principal ? { principal } : undefined,
-  );
+  return upgradeWebSocket(() => ({
+    onOpen(_event, socket) {
+      const session = attachSocket(rpc, hub, socket.raw as WebSocket, principal ? { principal } : undefined);
+      sessions.add(session);
+    },
+  }))(context, next);
+});
 
-  sessions.add(session);
-  return response;
-}
+serve({ fetch: app.fetch, port: 8000, websocket: { server: new WebSocketServer({ noServer: true }) } });
 ```
 
 Without a socket, pass `principal` to `hub.connect(...)`. Keep the returned connection handle and use it with `subscribe`, `dispatchFrom`, `reconnect`, `unsubscribe`, `disconnect`, and `execFrom`.
@@ -151,4 +154,4 @@ A reconnect must keep the same principal ID. If it changes because of sign-in, s
 
 The host owns credential expiry and revocation. A granted `Subscribe` permission admits continued delivery until unsubscribe or disconnect; changing the policy does not eject an active subscriber. Keep socket sessions in a registry and call `session.close(1008, "Session ended")` when access ends. Work already admitted is not rolled back, and background work remains owned by its channel instance.
 
-Continue with [Routes and instances](/docs/routes-instances) to separate public and internal channel surfaces.
+Continue with [Routes and instances](/docs/guides/routes-instances) to separate public and internal channel surfaces.

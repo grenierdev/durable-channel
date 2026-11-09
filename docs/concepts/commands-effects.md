@@ -1,8 +1,7 @@
 ---
 title: Commands, effects, and background work
 description: Put server-only work in the right lifecycle stage without making reducers impure.
-section: Build
-order: 5
+order: 3
 visual: effects
 ---
 
@@ -53,4 +52,4 @@ Check `signal.aborted` after every `await`. Tasks are aborted by `ctx.abortBackg
 | Live event with no history | Notification |
 | Work that should not delay the caller | Background task |
 
-Continue with [Authentication and authorization](/docs/authentication) to attach trusted identity and enforce client permissions.
+Continue with [Clients and reconnect](/docs/concepts/clients-reconnect) to see how a client mirrors state across transport changes.

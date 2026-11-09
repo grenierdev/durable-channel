@@ -1,8 +1,7 @@
 ---
 title: Routes and instances
 description: Mount definitions on URI templates, create families, protect internal routes, and use typed handles.
-section: Operate
-order: 7
+order: 2
 visual: routes
 ---
 
@@ -51,4 +50,4 @@ durableRoutes()
 
 `destroy(uri)` removes persisted state, aborts background work, drops subscriptions, and removes the instance. The hub does not infer ownership between channels. A parent that owns children should destroy them explicitly in its own command.
 
-Continue with [Clients and reconnect](/docs/clients-reconnect) to keep mirrors current across transport changes.
+Continue with [Transport and storage](/docs/guides/transport-storage) to connect the protocol to your runtime.

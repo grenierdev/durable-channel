@@ -1,8 +1,7 @@
 ---
 title: Schema document
 description: Generate a machine-readable description of every mounted channel, action, command, and notification.
-section: Reference
-order: 10
+order: 1
 visual: schema
 ---
 

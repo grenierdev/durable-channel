@@ -1,8 +1,7 @@
 ---
 title: Core concepts
 description: Learn the four primitives and why pure reducers let the same definition run on both sides.
-section: Build
-order: 3
+order: 1
 visual: definition
 ---
 
@@ -44,4 +43,4 @@ The client and hub both run action reducers. A clock, random identifier, databas
 )
 ```
 
-Continue with [Actions and validation](/docs/actions) for commit rules and rejection behavior.
+Continue with [Actions and validation](/docs/concepts/actions) for commit rules and rejection behavior.

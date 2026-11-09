@@ -358,8 +358,8 @@ h3 { font-size: 17px; letter-spacing: -.02em; line-height: 1.35; font-weight: 70
 .guide-visual-step > div { min-width: 0; flex: 1; display: flex; align-items: center; gap: 9px; }
 .guide-visual-step svg { color: var(--blue); }
 .guide-visual-step span { display: grid; min-width: 0; }
-.guide-visual-step strong { color: var(--ink); font-size: 10px; line-height: 1.4; }
-.guide-visual-step small { margin-top: 2px; color: #5b6780; font-family: var(--font-mono); font-size: 7px; white-space: nowrap; }
+.guide-visual-step strong { color: var(--ink); font-size: 12px; font-weight: 600; line-height: 1.4; }
+.guide-visual-step small { margin-top: 2px; color: #5b6780; font-family: var(--font-mono); font-size: 10.5px; line-height: 1.5; white-space: nowrap; }
 .guide-visual-arrow { margin: 0 10px; color: #aab5ce !important; }
 
 .docs-lab { min-width: 0; border-radius: 12px; overflow: hidden; background: var(--blue-deep); color: var(--ice); }
@@ -483,6 +483,7 @@ h3 { font-size: 17px; letter-spacing: -.02em; line-height: 1.35; font-weight: 70
   .guide-visual-flow { grid-template-columns: 1fr 1fr; gap: 18px 0; }
   .guide-visual-step:nth-child(2) .guide-visual-arrow { display: none; }
   .guide-visual-arrow { margin-inline: 6px; }
+  .guide-visual-step small { white-space: normal; }
   .docs-lab { border-radius: 9px; }
   .docs-lab-track { grid-template-columns: 1fr; padding: 18px; }
   .docs-lab-node { grid-template-columns: 1fr auto; justify-items: start; align-items: center; width: 100%; padding: 12px 14px; }

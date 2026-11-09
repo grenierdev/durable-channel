@@ -1,9 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { allDocs } from 'content-collections'
-import { DocsShell, type DocRecord } from '../components/docs/DocsShell'
-
-const docs = [...allDocs].sort((a, b) => a.order - b.order) as DocRecord[]
-const overview = docs.find((doc) => doc.slug === 'overview')!
+import { DocsShell } from '../components/docs/DocsShell'
+import { overview } from '../lib/docs'
 
 export const Route = createFileRoute('/docs/')({
   head: () => ({
@@ -12,5 +9,5 @@ export const Route = createFileRoute('/docs/')({
       { name: 'description', content: overview.description },
     ],
   }),
-  component: () => <DocsShell doc={overview} docs={docs} />,
+  component: () => <DocsShell doc={overview} />,
 })

@@ -48,7 +48,7 @@ The demo's replay ring holds 64 actions. Reconnecting after a larger gap falls b
 
 ## Documentation and llms.txt
 
-The pages under `/docs` come from the Markdown files in `../docs`. The build also writes `/llms.txt` (an index of the pages) and `/llms-full.txt` (every page in reading order), following https://llmstxt.org.
+The pages under `/docs` come from the Markdown files in `../docs`: `index.md` is the introduction, and the folders `tutorial`, `concepts`, `guides` and `reference` are the sidebar sections. The folder names the section; `order` in the frontmatter sorts the pages inside it. The build also writes `/llms.txt` (an index of the pages) and `/llms-full.txt` (every page in reading order), following https://llmstxt.org.
 
 ## Design
 

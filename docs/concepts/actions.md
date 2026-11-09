@@ -1,8 +1,7 @@
 ---
 title: Actions and validation
 description: Follow an action from optimistic client state through validation, persistence, broadcast, and reconciliation.
-section: Build
-order: 4
+order: 2
 visual: commit
 ---
 
@@ -58,4 +57,4 @@ That envelope gives every observer the same account of what happened. The origin
 
 `dispatchFrom(..., { lenient: true })` converts unknown actions, server-only actions, and invalid payloads into rejected envelopes instead of throwing. The JSON-RPC surface always uses lenient dispatch so all subscribers see the same refusal.
 
-Continue with [Commands and effects](/docs/commands-effects) to place server work around the ordered reducer path.
+Continue with [Commands and effects](/docs/concepts/commands-effects) to place server work around the ordered reducer path.

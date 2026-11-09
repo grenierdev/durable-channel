@@ -52,13 +52,16 @@ const docs = defineCollection({
     content: v.string(),
     title: v.string(),
     description: v.string(),
-    section: v.picklist(['Start', 'Build', 'Operate', 'Reference']),
     order: v.number(),
     visual: v.picklist(['sync', 'definition', 'commit', 'effects', 'auth', 'routes', 'replay', 'transport', 'schema']),
   }),
   transform: async (document, context) => ({
     ...document,
-    slug: document._meta.path.replace(/^\//, ''),
+    /** The folder of a page under `docs/` names its section; `index.md` is the introduction. */
+    section: document._meta.directory === '.' || document._meta.directory === '' ? 'introduction' : document._meta.directory.split('/')[0],
+    slug: document._meta.path === 'index' ? '' : document._meta.path,
+    url: document._meta.path === 'index' ? '/docs' : `/docs/${document._meta.path}`,
+    file: `docs/${document._meta.filePath}`,
     html: await compileMarkdown(context, document, { remarkPlugins: [remarkGfm], rehypePlugins: [headingIds] }),
     headings: extractHeadings(document.content),
     /** The page body as written, for `/llms-full.txt`. */

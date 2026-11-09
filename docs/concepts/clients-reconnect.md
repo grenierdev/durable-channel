@@ -1,8 +1,7 @@
 ---
 title: Clients and reconnect
 description: Understand optimistic state, reconciliation, replay, snapshots, and the application’s retry boundary.
-section: Operate
-order: 8
+order: 4
 visual: replay
 ---
 
@@ -47,4 +46,4 @@ Reconnect rechecks the channel’s `Subscribe` permission for every requested UR
 
 `shutdown()` is different from a dropped transport. It settles pending work as lost, closes streams, and makes the client unusable. Use it when the application is truly done with the client.
 
-Continue with [Transport and storage](/docs/transport-storage) to connect the protocol to your runtime.
+Continue with the guides, starting with [Authentication and authorization](/docs/guides/authentication) to attach trusted identity and enforce client permissions.

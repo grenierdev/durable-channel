@@ -34,8 +34,8 @@ TypeScript definitions and Valibot schemas. The core uses web-standard APIs. Tra
 - Hosts may attach an authenticated, typed principal to a connection; commands and effects receive the full principal while action origins expose only its ID.
 - Authentication is optional. Applications declare channel authorization policies for client subscriptions, dispatches, and commands, and still own credential verification and revocation.
 - Commands and post-commit effects run on the server. Notifications are ephemeral.
-- Storage is an interface, with memory and Deno KV implementations. Memory storage is process-local.
-- The package is published to npm for Node and Deno consumers.
+- Storage is an interface, with memory and SQLite implementations. Memory storage is process-local.
+- The package is published to npm for Node.js consumers.
 
 ## Evidence on Hand
 

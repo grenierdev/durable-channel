@@ -1,8 +1,7 @@
 ---
-title: Durable state, one shared definition
+title: Introduction
 description: Understand the client–hub model and choose the shortest path to your first synchronized feature.
-section: Start
-order: 1
+order: 0
 visual: sync
 ---
 
@@ -22,11 +21,11 @@ other clients ← same reducer ← committed envelope ← broadcast
 
 ## Pick a path
 
-- **New to the library?** Build the counter in [Quick start](/docs/quick-start), then read [Core concepts](/docs/core-concepts).
-- **Designing your protocol?** Start with [Actions and validation](/docs/actions), then separate server work in [Commands and effects](/docs/commands-effects).
-- **Adding identity or access rules?** Read [Authentication and authorization](/docs/authentication) to attach principals and gate client operations.
-- **Shipping a connection?** Read [Clients and reconnect](/docs/clients-reconnect), followed by [Transport and storage](/docs/transport-storage).
-- **Generating tooling?** Go to [Schema document](/docs/schema-document) for the route description format.
+- **New to the library?** Build the counter in the [tutorial](/docs/tutorial/first-channel), then read [Core concepts](/docs/concepts/primitives).
+- **Designing your protocol?** Start with [Actions and validation](/docs/concepts/actions), then separate server work in [Commands and effects](/docs/concepts/commands-effects).
+- **Adding identity or access rules?** Read [Authentication and authorization](/docs/guides/authentication) to attach principals and gate client operations.
+- **Shipping a connection?** Read [Clients and reconnect](/docs/concepts/clients-reconnect), followed by [Transport and storage](/docs/guides/transport-storage).
+- **Generating tooling?** Go to [Schema document](/docs/reference/schema-document) for the route description format.
 
 ## What Durable Channel owns
 
@@ -51,4 +50,4 @@ That boundary is deliberate. The core uses web-standard APIs, while the JSON-RPC
 
 ## Before you build
 
-`durable-channel` is published to npm. Install it with `npm install durable-channel` or `deno add npm:durable-channel`; the examples in these guides import that package with Valibot.
+`durable-channel` is published to npm. Install it with `npm install durable-channel`; the examples in these guides import that package with Valibot.
