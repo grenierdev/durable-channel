@@ -1,0 +1,8 @@
+node_modules/
+.content-collections/
+dist/
+.output/
+.tanstack/
+.wrangler/
+test-results/
+playwright-report/

@@ -1,0 +1,62 @@
+import { chromium } from '@playwright/test'
+import AxeBuilder from '@axe-core/playwright'
+import assert from 'node:assert/strict'
+import { writeFile } from 'node:fs/promises'
+const browser = await chromium.launch({ headless: true })
+const baseURL = process.env.SITE_URL ?? 'http://127.0.0.1:3000'
+const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, permissions: ['clipboard-read', 'clipboard-write'] })
+const page = await context.newPage()
+const errors = []
+page.on('pageerror', error => errors.push(error.message))
+const results = []
+try {
+  await page.goto(baseURL, { waitUntil: 'networkidle' })
+  await page.getByRole('button', { name: 'Increment Client A' }).waitFor()
+  await page.waitForFunction(() => !document.querySelector('[aria-label="Increment Client A"]').disabled)
+  await page.getByRole('button', { name: 'Increment Client A' }).click()
+  await page.waitForFunction(() => document.querySelector('[data-testid="count-b"]').textContent === '01')
+  await page.getByRole('button', { name: 'Disconnect Client B' }).click()
+  await page.getByRole('button', { name: 'Reconnect Client B' }).waitFor()
+  await page.getByRole('button', { name: 'Increment Client A' }).click()
+  await page.waitForFunction(() => document.querySelector('[data-testid="count-hub"]').textContent === '02')
+  assert.equal(await page.getByTestId('count-b').textContent(), '01')
+  assert.equal(await page.getByRole('button', { name: 'Increment Client B' }).isDisabled(), true)
+  await page.getByRole('button', { name: 'Reconnect Client B' }).click()
+  await page.waitForFunction(() => document.querySelector('[data-testid="count-b"]').textContent === '02')
+  assert.match(await page.locator('.demo-bottom').textContent(), /Replayed 1 missed action/)
+  await page.getByRole('button', { name: 'Increment Client B' }).click()
+  await page.waitForFunction(() => document.querySelector('[data-testid="count-a"]').textContent === '03')
+  await page.getByRole('tab', { name: 'counter.ts' }).focus()
+  await page.keyboard.press('ArrowRight')
+  assert.equal(await page.getByRole('tab', { name: 'server.ts' }).getAttribute('aria-selected'), 'true')
+  await page.getByRole('button', { name: 'Copy code' }).click()
+  const copied = await page.evaluate(() => navigator.clipboard.readText())
+  assert.match(copied, /env: \{\}/)
+  await page.getByRole('tab', { name: 'counter.ts' }).click()
+  await page.getByRole('button', { name: 'Reset', exact: true }).click()
+  await page.waitForFunction(() => !document.querySelector('[aria-label="Increment Client A"]').disabled)
+  await page.waitForFunction(() => document.querySelector('.demo-bottom').textContent.includes('Try +1 on either client'))
+  assert.equal(await page.getByTestId('count-hub').textContent(), '00')
+  results.push({ interaction: 'optimistic increment, offline hold, real replay, bidirectional updates, reset, keyboard tabs, clipboard', pass: true })
+  for (const [name, width, height] of [['desktop', 1440, 1000], ['mobile', 390, 844], ['tablet', 768, 1024], ['desktop-1280', 1280, 900], ['mobile-320', 320, 740]]) {
+    await page.setViewportSize({ width, height })
+    await page.evaluate(async () => { await document.fonts.ready; window.scrollTo({ top: 0, behavior: 'instant' }); document.activeElement?.blur() })
+    await page.screenshot({ path: `.impeccable/review/${name}.png`, fullPage: true, animations: 'disabled' })
+    const overflow = await page.evaluate(() => ({ window: innerWidth, document: document.documentElement.scrollWidth }))
+    const axe = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze()
+    results.push({ name, overflow, violations: axe.violations.map(v => ({ id: v.id, impact: v.impact, nodes: v.nodes.map(n => ({ target: n.target, summary: n.failureSummary })) })) })
+  }
+  const noJS = await browser.newContext({ javaScriptEnabled: false })
+  const staticPage = await noJS.newPage()
+  await staticPage.goto(baseURL)
+  assert.match(await staticPage.locator('h1').innerText(), /State changes/)
+  assert.match(await staticPage.locator('pre').innerText(), /durableChannel/)
+  results.push({ staticHTML: 'Headline, content and quick-start code present without JavaScript', pass: true })
+  await noJS.close()
+  results.push({ browserErrors: errors })
+  await writeFile('.impeccable/review/checks.json', JSON.stringify(results, null, 2))
+  console.log(JSON.stringify(results, null, 2))
+  assert.equal(errors.length, 0)
+  assert.equal(results.some(r => r.overflow && r.overflow.document > r.overflow.window), false, 'page has horizontal overflow')
+  assert.equal(results.some(r => r.violations?.length), false, 'accessibility violations found')
+} finally { await browser.close() }
