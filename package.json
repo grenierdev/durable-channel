@@ -1,6 +1,6 @@
 {
 	"name": "durable-channel",
-	"version": "0.1.0-rc.0",
+	"version": "0.1.0",
 	"description": "Durable Channel is a library for building durable, stateful, and type-safe communication channels between clients and servers.",
 	"bugs": "https://github.com/grenierdev/durable-channel/issues",
 	"repository": {
